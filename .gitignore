@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+#Api keys
+.env
+earth-engine.json
+
+#macos
+.DS_Store
+.python-version
+
+#sample test
+tests/
+tmp_audio/

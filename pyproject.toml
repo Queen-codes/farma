@@ -1,0 +1,13 @@
+[project]
+name = "farma"
+version = "0.1.0"
+description = "Farma is an AI powered app that aims to provide additional, intelligent and coordinated solution to food insecurity in Africa."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "earthengine-api>=1.7.10",
+    "fastapi[standard-no-fastapi-cloud-cli]>=0.128.0",
+    "google-auth>=2.47.0",
+    "langchain-google-genai>=4.2.0",
+    "langgraph>=1.0.7",
+]
