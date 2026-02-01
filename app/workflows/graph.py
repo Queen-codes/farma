@@ -36,15 +36,16 @@ def route_input(state: FarmaState) -> Literal["sms_parser", "voice_parser"]:
     return "sms_parser"
 
 
-def intent_gate(state: FarmaState) -> FarmaState:
+def intent_gate(state: FarmaState) -> dict:
     """Centralized Gateway for routing and safety logic."""
     status = state.get("status")
     if status == "READY_FOR_ANALYSIS":
         print("Request Received. Starting Analysis...")
-        # send a text to let them know their message has been recieved??
-        state["status"] = "ANALYSIS_ONGOING"
+        # Return dict with update - don't mutate state directly
+        return {"status": "ANALYSIS_ONGOING"}
 
-    return state
+    # Return empty dict if no changes needed
+    return {}
 
 
 def route_by_intent(
@@ -125,7 +126,9 @@ def response_aggregator(state: FarmaState) -> dict:
         """
 
     try:
+        print("Calling synthesis LLM...")
         response = synthesis_llm.invoke([HumanMessage(content=prompt)])
+        print("Synthesis complete.")
 
         # Handle cases where response.content is a list (Gemini parts)
         if isinstance(response.content, list):
@@ -220,7 +223,8 @@ builder.add_conditional_edges(
     },
 )
 
-# Loan Flow: Geocoding -> Satellite -> (Conditional Route) -> Narrative -> Parallel(Decision & Advisory) -> Response -> Sender
+# Loan Flow: Geocoding -> Satellite -> (Conditional Route) -> Narrative -> Decision -> Advisory -> Response -> Sender
+# loan_decision and climate_advisory run sequentially to avoid fan-in deadlock at response_aggregator.
 builder.add_edge("geocoding_node", "satellite_analysis_node")
 builder.add_conditional_edges(
     "satellite_analysis_node",
@@ -231,8 +235,7 @@ builder.add_conditional_edges(
     },
 )
 builder.add_edge("narrative_orchestration", "loan_decision")
-builder.add_edge("narrative_orchestration", "climate_advisory")
-builder.add_edge("loan_decision", "response_aggregator")
+builder.add_edge("loan_decision", "climate_advisory")
 builder.add_edge("climate_advisory", "response_aggregator")
 builder.add_edge("response_aggregator", "sms_sender")
 
