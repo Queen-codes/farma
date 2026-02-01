@@ -11,6 +11,7 @@ from app.workflows.nodes.geospatial_engine import (
     satellite_analysis_node,
 )
 from app.workflows.nodes.narrative_engine import narrative_orchestration_node
+from app.workflows.nodes.aegis_integration import aegis_risk_check_node
 from app.workflows.nodes.handlers import (
     loan_decision_node,
     climate_advisory_handler,
@@ -168,15 +169,15 @@ def sms_sender_node(state: FarmaState) -> dict:
 
 def route_satellite_results(
     state: FarmaState,
-) -> Literal["geocoding_node", "narrative_orchestration"]:
-    """Implements the rediriection if water/barren detected."""
+) -> Literal["geocoding_node", "aegis_risk_check"]:
+    """Implements the redirection if water/barren detected."""
     risk_flags = state.get("risk_flags", [])
     if "LOCATION_REVIEW_REQUIRED" in risk_flags:
         print(
             "REDIRECT: Location review required. Retrying geocoding with offset logic."
         )
         return "geocoding_node"
-    return "narrative_orchestration"
+    return "aegis_risk_check"  # route to Aegis check before credit decision
 
 
 # build graph
@@ -190,6 +191,7 @@ builder.add_node("intent_gate", intent_gate)
 # Engines
 builder.add_node("geocoding_node", geocoding_node)
 builder.add_node("satellite_analysis_node", satellite_analysis_node)
+builder.add_node("aegis_risk_check", aegis_risk_check_node)  # Aegis integration
 builder.add_node("narrative_orchestration", narrative_orchestration_node)
 builder.add_node("disease_generator", disease_generator)
 builder.add_node("disease_evaluator", disease_evaluator)
@@ -231,9 +233,12 @@ builder.add_conditional_edges(
     route_satellite_results,
     {
         "geocoding_node": "geocoding_node",
-        "narrative_orchestration": "narrative_orchestration",
+        "aegis_risk_check": "aegis_risk_check",  # Route to Aegis check
     },
 )
+builder.add_edge(
+    "aegis_risk_check", "narrative_orchestration"
+)  # Aegis -> Credit Decision
 builder.add_edge("narrative_orchestration", "loan_decision")
 builder.add_edge("loan_decision", "climate_advisory")
 builder.add_edge("climate_advisory", "response_aggregator")
