@@ -1,7 +1,7 @@
 [project]
 name = "farma"
 version = "0.1.0"
-description = "Farma is an AI powered app that aims to provide additional, intelligent and coordinated solution to food insecurity in Africa."
+description = "Farma is a semi-autonomous directed humanitarian and agricultural intelligence System for Food Insecurity in Nigeria"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -9,5 +9,14 @@ dependencies = [
     "fastapi[standard-no-fastapi-cloud-cli]>=0.128.0",
     "google-auth>=2.47.0",
     "langchain-google-genai>=4.2.0",
+    "google-genai>=1.0.0",
     "langgraph>=1.0.7",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "asyncpg>=0.29.0",
+    "psycopg[binary]>=3.1.0",
+    "pandas>=3.0.0",
+    "openpyxl>=3.1.5",
+    "reportlab>=4.0.0",
+    "python-dotenv>=1.0.0",
+    "matplotlib>=3.8.0",
 ]

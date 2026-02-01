@@ -11,6 +11,7 @@ wheels/
 
 #Api keys
 .env
+.env.example
 earth-engine.json
 
 #macos
@@ -20,3 +21,7 @@ earth-engine.json
 #sample test
 tests/
 tmp_audio/
+
+reports/
+scripts/
+ref_data/
