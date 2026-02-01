@@ -61,7 +61,8 @@ def sms_parser_node(state: FarmaState) -> dict:
             "farmer_response": None,  # Silence the parser
         }
 
-    except Exception:
+    except Exception as e:
+        print(f"SMS Parser Error: {e}")
         return {
             "intent": "HUMAN_ESCALATION",
             "status": "ESCALATE_TO_HUMAN",
