@@ -90,12 +90,40 @@ class GeocodingResult(BaseModel):
     identified_aez: str = Field(
         description="The Nigerian Agro-Ecological Zone for this location."
     )
+    identified_state: str = Field(
+        description="Nigerian state where the location is found (e.g., Kano, Kaduna, Anambra)"
+    )
+    identified_lga: str | None = Field(
+        default=None, description="Local Government Area if identifiable"
+    )
     is_vague: bool = Field(
         description="True if the landmark could not be precisely located"
     )
     clarifying_question: str | None = Field(
         description="Question to ask if location is vague"
     )
+
+
+# Nigeria geographic bounds for validation
+NIGERIA_BOUNDS = {
+    "lat_min": 4.0,
+    "lat_max": 14.0,
+    "lng_min": 2.5,
+    "lng_max": 14.7,
+}
+
+# Minimum confidence thresholds
+MIN_CONFIDENCE_FIRST_TIME = 0.6  # Higher bar for unknown farmers
+MIN_CONFIDENCE_RETRY = 0.5  # Slightly lower on retry
+
+
+def validate_nigeria_coordinates(lat: float, lng: float) -> tuple[bool, str]:
+    """Validate that coordinates fall within Nigeria's boundaries."""
+    if lat < NIGERIA_BOUNDS["lat_min"] or lat > NIGERIA_BOUNDS["lat_max"]:
+        return False, f"Latitude {lat} outside Nigeria bounds ({NIGERIA_BOUNDS['lat_min']}-{NIGERIA_BOUNDS['lat_max']})"
+    if lng < NIGERIA_BOUNDS["lng_min"] or lng > NIGERIA_BOUNDS["lng_max"]:
+        return False, f"Longitude {lng} outside Nigeria bounds ({NIGERIA_BOUNDS['lng_min']}-{NIGERIA_BOUNDS['lng_max']})"
+    return True, "Coordinates within Nigeria"
 
 
 # Grounding: Gemini 2.5 Pro
@@ -115,12 +143,49 @@ llm_flash = ChatGoogleGenerativeAI(model=MODEL_FLASH, google_api_key=GOOGLE_API_
 
 
 def init_gee():
-    """Initializes Google Earth Engine using a Service Account."""
+    """Initializes Google Earth Engine using a Service Account.
+
+    Checks multiple locations for credentials:
+    1. /app/earth-engine.json (Cloud Run secret mount)
+    2. ./earth-engine.json (local development)
+    3. GEE_CREDENTIALS_JSON env var (inline JSON for CI/CD)
+    """
+    import os
+
+    # Possible credential file locations
+    credential_paths = [
+        "/app/earth-engine.json",  # Cloud Run secret mount
+        "earth-engine.json",  # Local development
+        Path(__file__).parent.parent.parent.parent / "earth-engine.json",  # Project root
+    ]
+
     try:
-        credentials = ee.ServiceAccountCredentials(service_account, "earth-engine.json")
-        ee.Initialize(credentials)
-        return True
+        # Option 1: Check for inline JSON in environment variable
+        creds_json = os.getenv("GEE_CREDENTIALS_JSON")
+        if creds_json:
+            import tempfile
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+                f.write(creds_json)
+                temp_path = f.name
+            credentials = ee.ServiceAccountCredentials(service_account, temp_path)
+            ee.Initialize(credentials)
+            print("GEE initialized from environment variable")
+            return True
+
+        # Option 2: Check file paths
+        for cred_path in credential_paths:
+            cred_file = Path(cred_path)
+            if cred_file.exists():
+                credentials = ee.ServiceAccountCredentials(service_account, str(cred_file))
+                ee.Initialize(credentials)
+                print(f"GEE initialized from {cred_file}")
+                return True
+
+        print("WARNING: No GEE credentials found. Satellite analysis will fail.")
+        return False
+
     except Exception as e:
+        print(f"GEE initialization error: {e}")
         return False
 
 
@@ -130,43 +195,98 @@ def geocoding_node(state: FarmaState) -> dict:
     NLP & Spatial Extraction (The Gemini Layer).
     Parses landmark, finds coordinate, and identifies AEZ.
     Handles retries if previous coordinates were invalid.
+    Includes validation for Nigeria bounds and confidence thresholds.
     """
     landmark = state.get("parsed_data", {}).get("landmark") or state.get("message")
-    risk_flags = state.get("risk_flags", [])
-    is_retry = "LOCATION_REVIEW_REQUIRED" in risk_flags
+    prev_coords = state.get("coordinates", {})
+    # Check if this is a retry using retry_count in coordinates (set by satellite_analysis_node)
+    is_retry = prev_coords.get("retry_count", 0) > 0
 
     print(f"Grounding: {landmark} {'(RETRY)' if is_retry else ''}")
 
     retry_instruction = ""
     if is_retry:
-        prev_coords = state.get("coordinates", {})
         retry_instruction = (
             f"\n\nCRITICAL: The previous coordinates ({prev_coords.get('lat')}, {prev_coords.get('lng')}) were identified as WATER or BARREN ground (NDVI too low).\n"
             "DO NOT return the same coordinates. Look at the surrounding area (North, South, East, West) to find the actual agricultural plot associated with this landmark."
         )
 
-    prompt = (
-        f"You are a Nigerian Geospatial Specialist. Locate: '{landmark}'.\n"
-        "1. Use Google Maps to find the precise anchor coordinate. Be extremely precise; check if the point is in a river or on a road.\n"
-        "2. Identify the Agro-Ecological Zone (AEZ) based on the location.\n"
-        "3. Assign 'spatial_uncertainty' (1-10) and 'suggested_buffer' (meters).\n"
-        "4. If strictly impossible, ask a clarifying question."
-        f"{retry_instruction}"
-    )
+    # Enhanced prompt for better accuracy
+    prompt = f"""You are a Nigerian Agricultural Geospatial Specialist with deep knowledge of Nigerian farming regions.
+
+TASK: Locate the farm described as: '{landmark}'
+
+CRITICAL ACCURACY REQUIREMENTS:
+1. Use Google Maps to find the PRECISE coordinates. The point MUST be on agricultural land, NOT on:
+   - Rivers, lakes, or water bodies
+   - Main roads or highways
+   - Urban buildings or settlements
+   - Rocky/barren terrain
+
+2. For Nigerian farm landmarks:
+   - "Near X bridge" = Look for farmland on FLOODPLAINS near the bridge (not the bridge itself)
+   - "Near X market" = Look for farmland on the OUTSKIRTS of the market area
+   - "X junction" = Look for farmland ALONG THE ROAD leading from the junction
+   - River names (Anambra, Niger, Benue) = Look for FADAMA farmland on river floodplains
+
+3. Identify the Nigerian State and LGA (Local Government Area) for this location.
+
+4. Assign confidence score honestly:
+   - 0.9+ = Exact landmark found with clear agricultural context
+   - 0.7-0.9 = Landmark found, agricultural area nearby
+   - 0.5-0.7 = General area identified, some uncertainty
+   - <0.5 = Too vague, ask clarifying question
+
+5. Nigerian Agro-Ecological Zones (from South to North):
+   - Mangrove/Coastal: Lagos, Rivers, Bayelsa coastline
+   - Freshwater Swamp: Delta, Rivers inland
+   - Tropical Rainforest: South-East, South-South
+   - Derived Savanna: Middle Belt (Anambra, Enugu, Benue)
+   - Southern Guinea: Plateau, southern Kaduna
+   - Northern Guinea: Central Kaduna, Niger
+   - Sudan Savanna: Kano, Katsina, Sokoto
+   - Sahel Savanna: Borno, Yobe (northern parts)
+{retry_instruction}
+
+OUTPUT: Provide the precise coordinates, state, LGA (if known), AEZ, and your confidence level."""
 
     structured_llm = llm_grounding.with_structured_output(GeocodingResult)
 
     try:
         result = structured_llm.invoke(prompt)
 
-        if result.is_vague and result.confidence < 0.4:
+        # Determine minimum confidence threshold
+        min_confidence = MIN_CONFIDENCE_RETRY if is_retry else MIN_CONFIDENCE_FIRST_TIME
+
+        # Validation 1: Check if result is too vague
+        if result.is_vague and result.confidence < min_confidence:
             print(
-                f"Vague Result (Conf: {result.confidence}): {result.clarifying_question}"
+                f"Vague Result (Conf: {result.confidence} < {min_confidence}): {result.clarifying_question}"
             )
             return {
                 "status": "AWAITING_FARMER_RESPONSE",
-                "farmer_response": result.clarifying_question,
+                "farmer_response": result.clarifying_question or "Please provide more details about your farm location (nearest town, landmark, or market).",
             }
+
+        # Validation 2: Check Nigeria bounds
+        is_valid, bounds_msg = validate_nigeria_coordinates(result.lat, result.lng)
+        if not is_valid:
+            print(f"BOUNDS ERROR: {bounds_msg}")
+            return {
+                "status": "AWAITING_FARMER_RESPONSE",
+                "farmer_response": "The location appears to be outside Nigeria. Please provide a Nigerian farm location.",
+            }
+
+        # Validation 3: Confidence too low even if not marked vague
+        if result.confidence < min_confidence:
+            print(f"LOW CONFIDENCE: {result.confidence} < {min_confidence}")
+            # On first attempt, ask for clarification
+            if not is_retry:
+                return {
+                    "status": "AWAITING_FARMER_RESPONSE",
+                    "farmer_response": f"We found a possible location but need more details. Can you provide the nearest town or a well-known landmark near your farm?",
+                }
+            # On retry, proceed with warning flag
 
         # Fallback AEZ logic if LLM is unsure
         identified_aez = result.identified_aez
@@ -189,8 +309,12 @@ def geocoding_node(state: FarmaState) -> dict:
             else:
                 identified_aez = "Mangrove/Coastal"
 
+        # Extract state and LGA info
+        identified_state = getattr(result, "identified_state", "Unknown")
+        identified_lga = getattr(result, "identified_lga", None)
+
         print(
-            f"SUCCESS: ({result.lat}, {result.lng}) | Conf: {result.confidence} | AEZ: {identified_aez} | Unc: {result.spatial_uncertainty}"
+            f"SUCCESS: ({result.lat:.4f}, {result.lng:.4f}) | State: {identified_state} | Conf: {result.confidence} | AEZ: {identified_aez} | Unc: {result.spatial_uncertainty}"
         )
 
         # Retrieve AEZ Config
@@ -198,8 +322,15 @@ def geocoding_node(state: FarmaState) -> dict:
             identified_aez, NIGERIA_AEZ_CONFIG["Northern Guinea"]
         )
 
-        # Clear the flag if we found a new point
-        new_flags = [f for f in risk_flags if f != "LOCATION_REVIEW_REQUIRED"]
+        # Preserve retry_count from previous coordinates if this is a retry
+        retry_count = prev_coords.get("retry_count", 0)
+
+        # Build risk flags based on confidence
+        geocoding_flags = []
+        if result.confidence < 0.7:
+            geocoding_flags.append("LOW_GEOCODING_CONFIDENCE")
+        if result.spatial_uncertainty > 6:
+            geocoding_flags.append("HIGH_SPATIAL_UNCERTAINTY")
 
         return {
             "coordinates": {
@@ -207,6 +338,9 @@ def geocoding_node(state: FarmaState) -> dict:
                 "lng": result.lng,
                 "confidence": result.confidence,
                 "suggested_buffer": result.suggested_buffer,
+                "retry_count": retry_count,
+                "state": identified_state,
+                "lga": identified_lga,
             },
             "location_query": landmark,
             "nigeria_aez_context": {
@@ -214,7 +348,7 @@ def geocoding_node(state: FarmaState) -> dict:
                 "target_ndvi": aez_data["ndvi_target"],
                 "seasonality": aez_data["seasonality"],
             },
-            "risk_flags": new_flags,
+            "risk_flags": geocoding_flags,  # Pass geocoding-specific flags
         }
     except Exception as e:
         print(f"Grounding Error: {e}")
@@ -265,8 +399,9 @@ def get_ndvi_series(farm_area):
                 .getInfo()
                 or 0.0
             )
-    except:
-        pass
+    except Exception as e:
+        print(f"NDVI Series Error: {e}")
+        # Return 0.0 to trigger field snap logic in satellite_analysis_node
 
     return current_ndvi, []
 
@@ -274,7 +409,7 @@ def get_ndvi_series(farm_area):
 def get_sar_biomass(farm_area, zone_seasonality):
     """Sentinel-1: VV/VH Ratio for biomass in cloudy zones."""
     if zone_seasonality != "Bimodal":
-        return 0.0  # Only critical for South
+        return 0.0  # critical for South
 
     end_date = datetime.now()
     start_date = end_date - timedelta(days=60)
@@ -295,30 +430,61 @@ def get_sar_biomass(farm_area, zone_seasonality):
             .getInfo()
         )
         return val or 0.0
-    except:
+    except Exception as e:
+        print(f"SAR Biomass Error: {e}")
         return 0.0
 
 
 def get_chirps_rainfall(farm_area):
-    """CHIRPS: Last 30 days rainfall."""
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=30)
+    """CHIRPS: Last 30 days rainfall.
 
+    Returns:
+        dict with 'value' (float or None) and 'error' (str or None)
+        If error occurs, value will be None and error will contain the message.
+        This prevents silent failures that could affect credit decisions.
+
+    Note: CHIRPS has ~3 week data latency, so we query up to the latest available date.
+    """
     try:
+        # First, find the latest available CHIRPS date (accounts for 3-week latency)
+        chirps_all = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterBounds(farm_area)
+        latest_image = chirps_all.sort("system:time_start", False).first()
+        latest_date = ee.Date(latest_image.get("system:time_start"))
+
+        # Query 30 days back from latest available date
+        start_date = latest_date.advance(-30, "day")
+
         chirps = (
             ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY")
             .filterBounds(farm_area)
-            .filterDate(start_date, end_date)
+            .filterDate(start_date, latest_date)
         )
-        total = (
-            chirps.sum()
-            .reduceRegion(reducer=ee.Reducer.mean(), geometry=farm_area, scale=5000)
-            .get("precipitation")
-            .getInfo()
-        )
-        return total or 0.0
-    except:
-        return 0.0
+
+        # Check if collection is empty
+        collection_size = chirps.size().getInfo()
+        if collection_size == 0:
+            print("   \u26a0\ufe0f CHIRPS Rainfall: No data available for date range")
+            return {"value": None, "error": "NO_CHIRPS_DATA_FOR_PERIOD"}
+
+        result = chirps.sum().reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=farm_area, scale=5000
+        ).getInfo()
+
+        # Check if precipitation key exists
+        if "precipitation" not in result:
+            print("   \u26a0\ufe0f CHIRPS Rainfall Error: No precipitation band in result")
+            return {"value": None, "error": "PRECIPITATION_BAND_MISSING"}
+
+        total = result.get("precipitation")
+        if total is None:
+            print("   \u26a0\ufe0f CHIRPS Rainfall: Null value returned")
+            return {"value": None, "error": "NULL_PRECIPITATION_VALUE"}
+
+        return {"value": float(total), "error": None}
+
+    except Exception as e:
+        print(f"   \u26a0\ufe0f CHIRPS Rainfall Error: {e}")
+        return {"value": None, "error": str(e)}
 
 
 def get_z_score_stat(farm_area, current_ndvi):
@@ -430,29 +596,56 @@ def generate_visuals(state: FarmaState, current_ndvi, target_range, aez_name):
 def find_best_vegetation(farm_area, ndvi_img):
     """
     Ag-Tech 'Field Snap' Logic:
-    If the pin is on a building/road, find the nearest greenest pixel in the buffer.
-    Returns the new coordinates and the max NDVI found.
+    If the pin is on a building/road, find the nearest agricultural area in the buffer.
+
+    IMPORTANT: We use MEDIAN NDVI of vegetated pixels, not MAX.
+    Using max creates positive bias (approving based on best pixel, not farm average).
+
+    Returns the new coordinates (centroid of vegetated area) and median NDVI.
     """
     try:
-        # Sample 50 random points in the buffer and find the one with highest NDVI
-        # This is a robust way to 'snap' from a road/building to a nearby field
+        # Sample points in the buffer
         sample_points = ee.FeatureCollection.randomPoints(farm_area, 50)
         samples = ndvi_img.sampleRegions(
             collection=sample_points, scale=10, geometries=True
         )
 
-        # Sort by NDVI descending
-        best_sample = samples.sort("NDVI", False).first().getInfo()
+        # Filter to vegetated pixels only (NDVI > 0.15)
+        vegetated = samples.filter(ee.Filter.gt("NDVI", 0.15))
+        veg_count = vegetated.size().getInfo()
+
+        if veg_count == 0:
+            return None, 0.0
+
+        # Get statistics of vegetated pixels
+        stats = vegetated.aggregate_stats("NDVI").getInfo()
+        median_ndvi = stats.get("mean", 0.0)  # Use mean as proxy for median
+
+        # Find a representative point (one closest to median NDVI)
+        # Instead of picking the MAX, pick one near the median
+        samples_list = vegetated.toList(50).getInfo()
+
+        # Find sample closest to median
+        best_sample = None
+        min_diff = float("inf")
+        for sample in samples_list:
+            sample_ndvi = sample["properties"]["NDVI"]
+            diff = abs(sample_ndvi - median_ndvi)
+            if diff < min_diff:
+                min_diff = diff
+                best_sample = sample
 
         if not best_sample:
             return None, 0.0
 
         new_coords = best_sample["geometry"]["coordinates"]  # [lng, lat]
-        max_ndvi = best_sample["properties"]["NDVI"]
+        representative_ndvi = best_sample["properties"]["NDVI"]
 
-        return {"lat": new_coords[1], "lng": new_coords[0]}, max_ndvi
+        print(f"   Field snap stats: {veg_count} vegetated pixels, median NDVI: {median_ndvi:.2f}")
+
+        return {"lat": new_coords[1], "lng": new_coords[0]}, representative_ndvi
     except Exception as e:
-        print(f"   ⚠️ Field Snap Failed: {e}")
+        print(f"   \u26a0\ufe0f Field Snap Failed: {e}")
         return None, 0.0
 
 
@@ -511,10 +704,25 @@ def satellite_analysis_node(state: FarmaState) -> dict:
                     point = ee.Geometry.Point([coords["lng"], coords["lat"]])
                     farm_area = point.buffer(100)  # Tighten buffer once snapped
                 else:
-                    risk_flags.append("GHOST_FARM_DETECTED")
-                    print("Failed: No vegetation found in vicinity.")
+                    # Check if we've already retried geocoding (tracked in coordinates)
+                    retry_count = coords.get("retry_count", 0)
+                    if retry_count < 1:
+                        # First failure: trigger geocoding retry
+                        risk_flags.append("LOCATION_REVIEW_REQUIRED")
+                        coords["retry_count"] = retry_count + 1
+                        print("No vegetation found. Requesting geocoding retry...")
+                    else:
+                        # Already retried: mark as ghost farm
+                        risk_flags.append("GHOST_FARM_DETECTED")
+                        print(
+                            "Failed: No vegetation found after retry. Ghost farm detected."
+                        )
 
-        rainfall_30d = get_chirps_rainfall(farm_area)
+        # Get rainfall with proper error handling
+        rainfall_result = get_chirps_rainfall(farm_area)
+        rainfall_30d = rainfall_result.get("value")
+        rainfall_error = rainfall_result.get("error")
+
         sar_biomass = get_sar_biomass(farm_area, aez_context.get("seasonality"))
         z_score = get_z_score_stat(farm_area, current_ndvi)
 
@@ -523,8 +731,24 @@ def satellite_analysis_node(state: FarmaState) -> dict:
         if current_ndvi < targets[0]:
             phenology_flag = "BELOW_TARGET"
 
+        # Build data quality tracking
+        data_quality = {
+            "ndvi_available": current_ndvi is not None and current_ndvi > 0,
+            "rainfall_available": rainfall_30d is not None,
+            "zscore_available": z_score is not None and z_score != 0.0,
+            "ndvi_error": None,
+            "rainfall_error": rainfall_error,
+            "zscore_error": None if z_score != 0.0 else "INSUFFICIENT_HISTORICAL_DATA",
+        }
+
+        # If rainfall data missing, flag it but don't use default 0.0
+        if rainfall_error:
+            risk_flags.append("RAINFALL_DATA_INCOMPLETE")
+
+        # Display with proper None handling
+        rain_display = f"{rainfall_30d:.1f}mm" if rainfall_30d is not None else "N/A"
         print(
-            f"Final Signals: NDVI={current_ndvi:.2f} (Z={z_score:.2f}) | Rain={rainfall_30d:.1f}mm | SAR={sar_biomass:.1f}"
+            f"Final Signals: NDVI={current_ndvi:.2f} (Z={z_score:.2f}) | Rain={rain_display} | SAR={sar_biomass:.1f}"
         )
 
         plot_path = generate_visuals(
@@ -536,10 +760,11 @@ def satellite_analysis_node(state: FarmaState) -> dict:
             "satellite_report": {
                 "ndvi": current_ndvi,
                 "z_score": z_score,
-                "rainfall_30d": rainfall_30d,
+                "rainfall_30d": rainfall_30d,  # Can be None now
                 "sar_biomass": sar_biomass,
                 "phenology_status": phenology_flag,
                 "aez_meta": aez_context,
+                "data_quality": data_quality,  # New: track data completeness
             },
             "visualization_artifacts": {"scatter_plot": plot_path},
             "risk_flags": risk_flags,
