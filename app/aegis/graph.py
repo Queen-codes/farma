@@ -69,20 +69,34 @@ def state_worker(state_name: str, days_back: int) -> StateWorkerResult:
 
     print(f"[WORKER] Collecting data: {state_name}")
 
-    # Run all 4 tools
+    # Run all 4 tools - they now always return results (with error field if failed)
     conflict = search_conflict_events(state_name, days_back)
     displacement = search_displacement(state_name, days_back)
     food_security = search_food_security(state_name, days_back)
     economic = search_economic_indicators(state_name, days_back)
 
-    print(f"[WORKER] {state_name} → Data collected")
+    # Track any collection errors
+    errors = []
+    if conflict.error:
+        errors.append(f"conflict: {conflict.error}")
+    if displacement.error:
+        errors.append(f"displacement: {displacement.error}")
+    if food_security.error:
+        errors.append(f"food_security: {food_security.error}")
+    if economic.error:
+        errors.append(f"economic: {economic.error}")
+    
+    if errors:
+        print(f"[WORKER] {state_name} → Completed with {len(errors)} collection error(s)")
+    else:
+        print(f"[WORKER] {state_name} → Data collected successfully")
 
     return {
         "state_name": state_name,
-        "conflict_data": conflict.model_dump() if conflict else None,
-        "displacement_data": displacement.model_dump() if displacement else None,
-        "food_security_data": food_security.model_dump() if food_security else None,
-        "economic_data": economic.model_dump() if economic else None,
+        "conflict_data": conflict.model_dump(),
+        "displacement_data": displacement.model_dump(),
+        "food_security_data": food_security.model_dump(),
+        "economic_data": economic.model_dump(),
     }
 
 
@@ -160,20 +174,31 @@ async def persist_node(state: AegisGraphState) -> dict:
     """
     Persist: Save RAW data to PostgreSQL.
     Computes summary counts but NO analysis.
+    Tracks collection errors for monitoring.
     """
     print(f"\nPersisting to database...")
 
     results = state.get("state_results", [])
 
     # Compute summary counts (factual aggregation, not analysis)
+    # Only count data from successful collections (no error field)
     total_events = 0
     total_fatalities = 0
+    collection_errors = 0
 
     for r in results:
-        if r.get("conflict_data"):
-            total_events += r["conflict_data"].get("total_events", 0)
-            for event in r["conflict_data"].get("events", []):
+        conflict_data = r.get("conflict_data", {})
+        # Only count if no error
+        if conflict_data and not conflict_data.get("error"):
+            total_events += conflict_data.get("total_events", 0)
+            for event in conflict_data.get("events", []):
                 total_fatalities += event.get("fatalities", 0) or 0
+        
+        # Track errors across all tools
+        for tool_name in ["conflict_data", "displacement_data", "food_security_data", "economic_data"]:
+            tool_data = r.get(tool_name, {})
+            if tool_data and tool_data.get("error"):
+                collection_errors += 1
 
     async with async_session() as session:
         # Create scan record
@@ -181,7 +206,7 @@ async def persist_node(state: AegisGraphState) -> dict:
             run_id=state["run_id"],
             started_at=datetime.fromisoformat(state["started_at"]),
             completed_at=datetime.now(timezone.utc),
-            status="completed",
+            status="completed" if collection_errors == 0 else "completed_with_errors",
             states_scanned=len(results),
             total_events=total_events,
             total_fatalities=total_fatalities,
@@ -191,45 +216,53 @@ async def persist_node(state: AegisGraphState) -> dict:
 
         # Create state intel records
         for r in results:
+            conflict_data = r.get("conflict_data", {})
+            displacement_data = r.get("displacement_data", {})
+            food_security_data = r.get("food_security_data", {})
+            economic_data = r.get("economic_data", {})
+            
             intel = StateIntelligence(
                 scan_id=scan.id,
                 state_name=r["state_name"],
-                # Store raw JSON data from each tool
-                conflict_raw=r.get("conflict_data"),
-                displacement_raw=r.get("displacement_data"),
-                food_security_raw=r.get("food_security_data"),
-                economic_raw=r.get("economic_data"),
-                # Extract key facts for querying
+                # Store raw JSON data from each tool (includes error info for debugging)
+                conflict_raw=conflict_data if conflict_data else None,
+                displacement_raw=displacement_data if displacement_data else None,
+                food_security_raw=food_security_data if food_security_data else None,
+                economic_raw=economic_data if economic_data else None,
+                # Extract key facts for querying - only if no error
                 conflict_events_count=(
-                    r["conflict_data"]["total_events"] if r.get("conflict_data") else 0
+                    conflict_data.get("total_events", 0) 
+                    if conflict_data and not conflict_data.get("error") 
+                    else 0
                 ),
                 idp_estimate=(
-                    r["displacement_data"]["idp_estimate"]
-                    if r.get("displacement_data")
+                    displacement_data.get("idp_estimate")
+                    if displacement_data and not displacement_data.get("error")
                     else None
                 ),
                 food_insecurity_level=(
-                    r["food_security_data"]["acute_food_insecurity"]
-                    if r.get("food_security_data")
+                    food_security_data.get("acute_food_insecurity", "unknown")
+                    if food_security_data and not food_security_data.get("error")
                     else "unknown"
                 ),
                 ipc_phase=(
-                    r["food_security_data"]["ipc_phase"]
-                    if r.get("food_security_data")
+                    food_security_data.get("ipc_phase")
+                    if food_security_data and not food_security_data.get("error")
                     else None
                 ),
                 markets_operational=(
-                    r["economic_data"]["markets_operational"]
-                    if r.get("economic_data")
+                    economic_data.get("markets_operational", "unknown")
+                    if economic_data and not economic_data.get("error")
                     else "unknown"
                 ),
             )
             session.add(intel)
 
             # Create individual conflict event records for detailed queries
-            if r.get("conflict_data"):
+            # Only if conflict data collection succeeded
+            if conflict_data and not conflict_data.get("error"):
                 await session.flush()  # Get intel.id
-                for event in r["conflict_data"].get("events", []):
+                for event in conflict_data.get("events", []):
                     db_event = DBConflictEvent(
                         state_intel_id=intel.id,
                         event_date=event.get("date", ""),
@@ -252,12 +285,14 @@ async def persist_node(state: AegisGraphState) -> dict:
     print(
         f"States: {len(results)} | Events: {total_events} | Fatalities: {total_fatalities}"
     )
+    if collection_errors > 0:
+        print(f"⚠️  Collection errors: {collection_errors} (data stored for debugging)")
 
     return {
         "total_events": total_events,
         "total_fatalities": total_fatalities,
         "states_scanned": len(results),
-        "status": "completed",
+        "status": "completed" if collection_errors == 0 else "completed_with_errors",
     }
 
 
