@@ -109,12 +109,17 @@ class FoodSecurityReport(BaseModel):
     grounding: Optional[GroundingMetadata] = Field(
         default=None, description="Google Search grounding metadata"
     )
+    
+    # Error tracking - None means successful collection
+    error: Optional[str] = Field(
+        default=None, description="Error message if data collection failed"
+    )
 
 
 def search_food_security(
     state: str,
     days_back: int = 14,
-) -> Optional[FoodSecurityReport]:
+) -> FoodSecurityReport:
     """
     Search for food security and agricultural conditions data.
 
@@ -212,6 +217,17 @@ Return ONLY valid JSON."""
         debug=True,
     )
 
+    # Handle error dict from grounded_search
+    if isinstance(result, dict) and "_collection_error" in result:
+        return FoodSecurityReport(
+            state=state,
+            search_date=datetime.now().strftime("%Y-%m-%d"),
+            timeframe=date_range,
+            sources_consulted=[s.uri for s in grounding.sources] if grounding.sources else [],
+            grounding=grounding,
+            error=result["_collection_error"],
+        )
+
     if result:
         result.search_date = datetime.now().strftime("%Y-%m-%d")
         result.timeframe = date_range
@@ -236,5 +252,13 @@ Return ONLY valid JSON."""
             print(f"   Ag challenges: {', '.join(result.agricultural_challenges[:3])}")
         if result.priority_lgas:
             print(f"   Priority LGAs: {', '.join(result.priority_lgas[:4])}")
+        
+        return result
 
-    return result
+    # Fallback if result is None (shouldn't happen with new grounded_search)
+    return FoodSecurityReport(
+        state=state,
+        search_date=datetime.now().strftime("%Y-%m-%d"),
+        timeframe=date_range,
+        error="Unknown error: grounded_search returned None",
+    )

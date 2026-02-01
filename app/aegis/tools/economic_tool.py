@@ -91,12 +91,17 @@ class EconomicReport(BaseModel):
     grounding: Optional[GroundingMetadata] = Field(
         default=None, description="Google Search grounding metadata"
     )
+    
+    # Error tracking - None means successful collection
+    error: Optional[str] = Field(
+        default=None, description="Error message if data collection failed"
+    )
 
 
 def search_economic_indicators(
     state: str,
     days_back: int = 7,
-) -> Optional[EconomicReport]:
+) -> EconomicReport:
     """
     Search for economic and market data affecting food security.
     """
@@ -183,6 +188,17 @@ Return ONLY valid JSON."""
         debug=True,
     )
 
+    # Handle error dict from grounded_search
+    if isinstance(result, dict) and "_collection_error" in result:
+        return EconomicReport(
+            state=state,
+            search_date=datetime.now().strftime("%Y-%m-%d"),
+            timeframe=date_range,
+            sources_consulted=[s.uri for s in grounding.sources] if grounding.sources else [],
+            grounding=grounding,
+            error=result["_collection_error"],
+        )
+
     if result:
         result.search_date = datetime.now().strftime("%Y-%m-%d")
         result.timeframe = date_range
@@ -211,5 +227,13 @@ Return ONLY valid JSON."""
 
         if result.food_aid_operations:
             print(f"Aid: {', '.join(result.food_aid_operations)}")
+        
+        return result
 
-    return result
+    # Fallback if result is None (shouldn't happen with new grounded_search)
+    return EconomicReport(
+        state=state,
+        search_date=datetime.now().strftime("%Y-%m-%d"),
+        timeframe=date_range,
+        error="Unknown error: grounded_search returned None",
+    )

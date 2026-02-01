@@ -161,13 +161,17 @@ def grounded_search(
 
     except json.JSONDecodeError as e:
         print(f"error parsing JSON: {e}")
-        return None, GroundingMetadata()
+        # Return error marker dict instead of None - downstream can check for 'error' key
+        error_result = {"_collection_error": f"JSON parse error: {str(e)}"}
+        return error_result, grounding if 'grounding' in dir() else GroundingMetadata()
     except Exception as e:
         print(f"   ERROR: {e}")
         import traceback
 
         traceback.print_exc()
-        return None, GroundingMetadata()
+        # Return error marker dict instead of None
+        error_result = {"_collection_error": f"Collection failed: {str(e)}"}
+        return error_result, GroundingMetadata()
 
 
 def get_date_range(days_back: int) -> tuple[str, int]:

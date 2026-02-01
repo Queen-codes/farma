@@ -69,12 +69,16 @@ class ConflictSearchResult(BaseModel):
     grounding: Optional[GroundingMetadata] = Field(
         default=None, description="Google Search grounding metadata"
     )
+    # Error tracking - None means successful collection
+    error: Optional[str] = Field(
+        default=None, description="Error message if data collection failed"
+    )
 
 
 def search_conflict_events(
     state: str,
     days_back: int = 7,
-) -> Optional[ConflictSearchResult]:
+) -> ConflictSearchResult:
     """
     Search for recent conflict/security events in a particular state of focus
 
@@ -202,10 +206,37 @@ Return ONLY valid JSON, no other text."""
 
     except json.JSONDecodeError as e:
         print(f"Error parsing JSON: {e}")
-        return None
+        # Return error result instead of None - allows downstream to distinguish
+        # "no events found" from "data collection failed"
+        return ConflictSearchResult(
+            state_searched=state,
+            search_date=datetime.now().strftime("%Y-%m-%d"),
+            timeframe=date_range,
+            events=[],
+            total_events=0,
+            sources_consulted=[],
+            grounding=GroundingMetadata(
+                search_queries=[],
+                sources=[],
+            ),
+            error=f"JSON parse error: {str(e)}",
+        )
     except Exception as e:
         print(f"Error: {e}")
         import traceback
 
         traceback.print_exc()
-        return None
+        # Return error result instead of None
+        return ConflictSearchResult(
+            state_searched=state,
+            search_date=datetime.now().strftime("%Y-%m-%d"),
+            timeframe=date_range,
+            events=[],
+            total_events=0,
+            sources_consulted=[],
+            grounding=GroundingMetadata(
+                search_queries=[],
+                sources=[],
+            ),
+            error=f"Collection failed: {str(e)}",
+        )
