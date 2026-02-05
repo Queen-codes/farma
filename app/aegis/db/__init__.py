@@ -15,6 +15,8 @@ from .models import (
     AegisScan,
     StateIntelligence,
     ConflictEvent,
+    LGARiskScore,
+    AegisReport,
 )
 
 __all__ = [
@@ -31,4 +33,6 @@ __all__ = [
     "AegisScan",
     "StateIntelligence",
     "ConflictEvent",
+    "LGARiskScore",
+    "AegisReport",
 ]

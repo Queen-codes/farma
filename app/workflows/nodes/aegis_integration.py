@@ -6,6 +6,7 @@ that could affect loan viability.
 """
 
 from typing import List, Optional
+import asyncio
 from app.workflows.state import FarmaState
 
 
@@ -23,101 +24,16 @@ def get_aegis_risk_sync(state: str, lga: Optional[str] = None) -> dict:
     """
     Synchronous version of Aegis risk query for LangGraph compatibility.
 
-    Uses synchronous SQLAlchemy session to avoid async loop issues.
+    Uses the async Aegis query under the hood, but runs it in a dedicated
+    event loop so it works from LangGraph sync nodes (including threadpool).
     """
     try:
-        from sqlalchemy import create_engine, select, desc
-        from sqlalchemy.orm import Session
-        from app.aegis.db.models import StateIntelligence, AegisScan
-        import os
-
-        # Get database URL from environment
-        database_url = os.getenv("DATABASE_URL")
-        if not database_url:
-            print("Aegis Check: No DATABASE_URL configured")
-            return {
-                "aegis_available": False,
-                "risk_flags": [],
-                "message": "Database not configured",
-            }
-
-        # Convert async URL to sync if needed
-        if database_url.startswith("postgresql+asyncpg"):
-            database_url = database_url.replace("postgresql+asyncpg", "postgresql")
-
-        engine = create_engine(database_url)
-
-        with Session(engine) as session:
-            # Get latest scan
-            latest_scan = session.execute(
-                select(AegisScan).order_by(desc(AegisScan.started_at)).limit(1)
-            ).scalar_one_or_none()
-
-            if not latest_scan:
-                return {
-                    "aegis_available": False,
-                    "risk_flags": [],
-                    "message": "No Aegis scan data available",
-                }
-
-            # Get state intelligence
-            intel = session.execute(
-                select(StateIntelligence).where(
-                    StateIntelligence.scan_id == latest_scan.id,
-                    StateIntelligence.state_name == state,
-                )
-            ).scalar_one_or_none()
-
-            if not intel:
-                return {
-                    "aegis_available": True,
-                    "risk_flags": [],
-                    "message": f"No specific intelligence for {state}",
-                }
-
-            # Build risk flags
-            risk_flags = []
-
-            if intel.ipc_phase:
-                if intel.ipc_phase >= 5:
-                    risk_flags.extend(["FAMINE_ZONE", "AEGIS_LOAN_PAUSE"])
-                elif intel.ipc_phase >= 4:
-                    risk_flags.extend(["FOOD_CRISIS_ZONE", "AEGIS_GRACE_PERIOD"])
-                elif intel.ipc_phase >= 3:
-                    risk_flags.append("FOOD_STRESSED_ZONE")
-
-            if intel.conflict_events_count:
-                if intel.conflict_events_count > 20:
-                    risk_flags.extend(["ACTIVE_CONFLICT", "AEGIS_LOAN_PAUSE"])
-                elif intel.conflict_events_count > 10:
-                    risk_flags.append("ELEVATED_CONFLICT")
-                elif intel.conflict_events_count > 5:
-                    risk_flags.append("CONFLICT_MONITOR")
-
-            if intel.idp_estimate:
-                if intel.idp_estimate > 100000:
-                    risk_flags.extend(["HIGH_DISPLACEMENT", "AEGIS_GRACE_PERIOD"])
-                elif intel.idp_estimate > 50000:
-                    risk_flags.append("MODERATE_DISPLACEMENT")
-
-            if intel.markets_operational is not None and intel.markets_operational < 50:
-                risk_flags.extend(["MARKET_DISRUPTION", "AEGIS_REPAYMENT_CONCERN"])
-
-            return {
-                "aegis_available": True,
-                "state": state,
-                "scan_date": latest_scan.started_at.isoformat() if latest_scan.started_at else None,
-                "risk_flags": risk_flags,
-                "details": {
-                    "ipc_phase": intel.ipc_phase,
-                    "ipc_description": IPC_PHASES.get(intel.ipc_phase, "Unknown"),
-                    "conflict_events": intel.conflict_events_count,
-                    "idp_estimate": intel.idp_estimate,
-                    "idp_trend": intel.idp_trend,
-                    "food_insecurity_level": intel.food_insecurity_level,
-                    "markets_operational_percent": intel.markets_operational,
-                },
-            }
+        try:
+            asyncio.get_running_loop()
+            # If we're already in an event loop, we can't block. Return "unknown" quickly.
+            return {"aegis_available": False, "risk_flags": [], "message": "Aegis query unavailable in running loop"}
+        except RuntimeError:
+            return asyncio.run(get_aegis_risk_for_location(state=state, lga=lga))
 
     except Exception as e:
         # Don't block loan processing if Aegis is unavailable
@@ -211,7 +127,8 @@ async def get_aegis_risk_for_location(
 
             # Market disruption
             if intel.markets_operational is not None:
-                if intel.markets_operational < 50:
+                market = str(intel.markets_operational).lower()
+                if market in ("closed", "partially", "partial", "limited"):
                     risk_flags.append("MARKET_DISRUPTION")
                     risk_flags.append("AEGIS_REPAYMENT_CONCERN")
 
@@ -227,7 +144,7 @@ async def get_aegis_risk_for_location(
                     "idp_estimate": intel.idp_estimate,
                     "idp_trend": intel.idp_trend,
                     "food_insecurity_level": intel.food_insecurity_level,
-                    "markets_operational_percent": intel.markets_operational,
+                    "markets_operational": intel.markets_operational,
                 },
             }
 
