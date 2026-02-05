@@ -35,3 +35,7 @@ ref_data/
 streamlit_app/
 
 docs/
+check_stability.py
+gcs_manager.py
+inspect_schema.py
+start_api.sh
