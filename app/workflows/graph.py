@@ -124,6 +124,7 @@ def response_aggregator(state: FarmaState) -> dict:
         Tone: Professional, clear, and encouraging. 
         Constraint: Max 160 characters (Standard SMS length). 
         If approved, tell them next steps. If rejected, provide the specific agronomic advice from the context.
+        IMPORTANT: Do NOT ask the farmer for rainfall data or any technical measurements. If you need clarification, ask for a simple landmark/village name or a WhatsApp GPS pin.
         """
 
     try:

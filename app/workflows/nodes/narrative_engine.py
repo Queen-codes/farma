@@ -145,6 +145,7 @@ Write 2-3 sentences of practical advice for this farmer. Be:
 - Actionable (what they should do next)
 
 Keep it under 100 words. Don't mention technical terms like NDVI or Z-Score."""
+    prompt += "\n\nIMPORTANT: Do not ask the farmer for rainfall data or any technical measurements. If clarification is needed, ask for a simple landmark or a WhatsApp GPS pin."
 
     try:
         response = llm_advisory.invoke(prompt)
