@@ -4,7 +4,7 @@ These schemas define the API contract that AI Studio will use
 to build the frontend.
 """
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from enum import Enum
@@ -37,6 +37,70 @@ class ReportStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     ERROR = "error"
+
+
+class ConflictEventSummary(BaseModel):
+    state: str
+    lga: Optional[str] = None
+    event_type: str
+    fatalities: Optional[int] = None
+    date: Optional[str] = None
+    summary: Optional[str] = None
+    location: Optional[str] = None
+    lat: Optional[float] = None
+    lon: Optional[float] = None
+
+
+class LGARiskEntry(BaseModel):
+    lga: str
+    state: str
+    event_count: int
+    fatalities: int
+    risk_score: int
+    risk_level: str  # CRITICAL | HIGH | ELEVATED | LOW
+
+
+class StateSummaryEntry(BaseModel):
+    state_name: str
+    conflict_events: int
+    idp_estimate: Optional[int] = None
+    idp_trend: str
+    food_insecurity_level: str
+    ipc_phase: Optional[int] = None
+    markets_operational: str
+    priority_level: Optional[str] = None
+    priority_score: Optional[int] = None
+
+
+class ParsedFarmerData(BaseModel):
+    crop_type: Optional[str] = None
+    amount: Optional[float] = None
+    landmark: Optional[str] = None
+    symptoms: Optional[str] = None
+
+
+class GeoCoordinates(BaseModel):
+    lat: Optional[float] = None
+    lng: Optional[float] = None
+    confidence: Optional[float] = None
+    state: Optional[str] = None
+    lga: Optional[str] = None
+
+
+class SatelliteData(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
+class AlertEntry(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
+class JobEventPayload(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
+class JobResult(BaseModel):
+    model_config = ConfigDict(extra="allow")
 
 
 # loan schemas
@@ -75,9 +139,9 @@ class FarmerResponse(BaseModel):
     status: str
     intent: Optional[str] = None
     language: Optional[str] = None
-    parsed_data: Optional[Dict[str, Any]] = None
+    parsed_data: Optional[ParsedFarmerData] = None
     farmer_response: Optional[str] = None
-    coordinates: Optional[Dict[str, Any]] = None
+    coordinates: Optional[GeoCoordinates] = None
     climate_score: Optional[float] = None
     final_decision: Optional[str] = None
     risk_flags: Optional[List[str]] = None
@@ -90,7 +154,7 @@ class LoanStatusResponse(BaseModel):
     status: str
     decision: Optional[LoanDecision] = None
     climate_score: Optional[float] = None
-    satellite_data: Optional[Dict[str, Any]] = None
+    satellite_data: Optional[SatelliteData] = None
     created_at: Optional[datetime] = None
     message: Optional[str] = None
 
@@ -101,6 +165,12 @@ class AegisScanRequest(BaseModel):
 
     states: Optional[List[str]] = Field(
         default=None, description="States to scan. Defaults to North East focus states."
+    )
+    days_back: int = Field(
+        default=7,
+        ge=1,
+        le=365,
+        description="How many days back to search for signals",
     )
     force_refresh: bool = Field(
         default=False, description="Force refresh even if recent data exists"
@@ -128,7 +198,9 @@ class AegisScanStatusResponse(BaseModel):
     states_scanned: int
     total_events: int
     total_fatalities: int
-    state_summaries: Optional[List[Dict[str, Any]]] = None
+    state_summaries: Optional[List[StateSummaryEntry]] = None
+    conflict_events: Optional[List[ConflictEventSummary]] = None
+    lga_risk: Optional[List[LGARiskEntry]] = None
 
 
 class AegisReportRequest(BaseModel):
@@ -145,6 +217,24 @@ class AegisReportRequest(BaseModel):
     include_annexes: bool = Field(
         default=True, description="Whether to include detailed state annexes"
     )
+
+
+class AegisSynthesisRequest(BaseModel):
+    """Request to synthesize an AEGIS scan into decision-grade assessments."""
+
+    scan_id: int = Field(..., description="Scan ID to synthesize")
+    states: Optional[List[str]] = Field(
+        default=None,
+        description="Specific states to include. Defaults to all scanned states.",
+    )
+
+
+class AegisSynthesisResponse(BaseModel):
+    """Response from synthesis initiation."""
+
+    run_id: str
+    status: str
+    message: str
 
 
 class AegisReportResponse(BaseModel):
@@ -196,7 +286,7 @@ class AegisDashboardResponse(BaseModel):
     total_reports: int
     focus_states: List[str]
     state_summaries: List[StateIntelligenceSummary]
-    recent_alerts: List[Dict[str, Any]] = []
+    recent_alerts: List[AlertEntry] = []
 
 
 # system
@@ -217,3 +307,37 @@ class ErrorResponse(BaseModel):
     error: str
     detail: Optional[str] = None
     code: Optional[str] = None
+
+
+# job contract
+class JobStatus(str, Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
+class JobEvent(BaseModel):
+    event_id: str
+    job_id: str
+    created_at: datetime
+    event_type: str
+    status: str
+    step: Optional[str] = None
+    message: Optional[str] = None
+    progress: Optional[float] = None
+    payload: Optional[JobEventPayload] = None
+
+
+class JobResponse(BaseModel):
+    job_id: str
+    job_type: str
+    status: JobStatus
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    result: Optional[JobResult] = None
+
+
+class JobEventsResponse(BaseModel):
+    job_id: str
+    events: List[JobEvent]
