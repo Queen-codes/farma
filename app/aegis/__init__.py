@@ -1,67 +1,37 @@
-"""AEGIS - Data Intelligence Module for FARMA.
+"""AEGIS - Humanitarian/Displacement intelligence for FARMA.
 
-This module COLLECTS humanitarian and security data.
-Analysis and risk assessment are handled by a separate Analysis Agent.
+engines/agent orchestration:
+- Scan: `app.aegis.scan` (Gemini grounded evidence collection)
+- Synthesis: `app.aegis.synthesis`
+- Report: `app.aegis.report`
+
+This package exports only stable entrypoints used by the API layer.
 """
 
-from .tools import (
-    # Shared
-    AEGIS_FOCUS_STATES,
-    # Tools
-    search_conflict_events,
-    search_displacement,
-    search_food_security,
-    search_economic_indicators,
-    # Models
-    ConflictSearchResult,
-    ConflictEvent,
-    DisplacementReport,
-    FoodSecurityReport,
-    EconomicReport,
-    MarketPrice,
-)
+from app.config import AEGIS_FOCUS_STATES
 
-from .db import (
+from app.aegis.db import (
     init_db,
     close_db,
     async_session,
     AegisScan,
     StateIntelligence,
     ConflictEvent as DBConflictEvent,
+    LGARiskScore,
+    AegisReport,
 )
 
-from .graph import (
-    aegis_graph,
-    run_aegis_scan,
-    AegisGraphState,
-    StateWorkerResult,
-)
+from app.aegis.graph import run_aegis_scan
 
 __all__ = [
-    # Focus States
     "AEGIS_FOCUS_STATES",
-    # Tools
-    "search_conflict_events",
-    "search_displacement",
-    "search_food_security",
-    "search_economic_indicators",
-    # Tool Result Models
-    "ConflictSearchResult",
-    "ConflictEvent",
-    "DisplacementReport",
-    "FoodSecurityReport",
-    "EconomicReport",
-    "MarketPrice",
-    # Database
     "init_db",
     "close_db",
     "async_session",
     "AegisScan",
     "StateIntelligence",
     "DBConflictEvent",
-    # Graph
-    "aegis_graph",
+    "LGARiskScore",
+    "AegisReport",
     "run_aegis_scan",
-    "AegisGraphState",
-    "StateWorkerResult",
 ]
