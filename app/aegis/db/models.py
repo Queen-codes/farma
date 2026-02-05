@@ -30,6 +30,10 @@ class AegisScan(Base):
     total_events: Mapped[int] = mapped_column(Integer, default=0)
     total_fatalities: Mapped[int] = mapped_column(Integer, default=0)
 
+    # Deterministic synthesis rollup JSON (persisted output of synthesis stage)
+    rollup_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    rollup_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
     # Relationship to state results
     state_results: Mapped[List["StateIntelligence"]] = relationship(
         back_populates="scan", cascade="all, delete-orphan"
@@ -59,6 +63,11 @@ class StateIntelligence(Base):
 
     # Economic tool raw output
     economic_raw: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+
+    # Deterministic synthesis assessment JSON (persisted output of synthesis stage)
+    assessment_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    synthesized_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    synthesis_version: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
 
     # facts extracted for querying  from the data,
 
@@ -104,6 +113,8 @@ class ConflictEvent(Base):
     location: Mapped[str] = mapped_column(String(200))
     state: Mapped[str] = mapped_column(String(50), index=True)
     lga: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    latitude: Mapped[Optional[float]] = mapped_column(nullable=True)
+    longitude: Mapped[Optional[float]] = mapped_column(nullable=True)
     event_type: Mapped[str] = mapped_column(String(50))
     actors: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
 
@@ -123,3 +134,40 @@ class ConflictEvent(Base):
     state_intel: Mapped["StateIntelligence"] = relationship(
         back_populates="conflict_events"
     )
+
+
+class LGARiskScore(Base):
+    __tablename__ = "aegis_lga_risk_scores"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    scan_id: Mapped[int] = mapped_column(ForeignKey("aegis_scans.id"), index=True)
+    lga: Mapped[str] = mapped_column(String(100), index=True)
+    state: Mapped[str] = mapped_column(String(50), index=True)
+    event_count: Mapped[int] = mapped_column(Integer, default=0)
+    fatalities: Mapped[int] = mapped_column(Integer, default=0)
+    risk_score: Mapped[int] = mapped_column(Integer, default=0)
+    risk_level: Mapped[str] = mapped_column(String(20), default="LOW")
+    computed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class AegisReport(Base):
+    """A generated PDF report tied to a scan."""
+
+    __tablename__ = "aegis_reports"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    report_id: Mapped[str] = mapped_column(String(50), unique=True, index=True)
+    scan_id: Mapped[int] = mapped_column(ForeignKey("aegis_scans.id"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True, index=True)
+
+    states: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    include_infographics: Mapped[bool] = mapped_column(default=True)
+    include_annexes: Mapped[bool] = mapped_column(default=True)
+
+    pdf_path: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
+    gcs_key: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
+
+    status: Mapped[str] = mapped_column(String(20), default="running")  # running/completed/failed
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

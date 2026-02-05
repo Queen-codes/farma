@@ -10,14 +10,19 @@ load_dotenv()
 
 # Database URL - async PostgreSQL
 # Format: postgresql+asyncpg://user:password@host:port/database
-DATABASE_URL = os.getenv(
-    "DATABASE_URL", "postgresql+asyncpg://farma_app:password@localhost:5432/farma"
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    DATABASE_URL = "postgresql+asyncpg://farma_app:password@localhost:5432/farma"
+    print(
+        "[FARMA] WARNING: DATABASE_URL not set, using localhost default. "
+        "Set DATABASE_URL env var for production."
+    )
 
 # Create async engine
 engine = create_async_engine(
     DATABASE_URL,
-    echo=False,  # Set True for SQL logging during development
+    echo=False,  # set to true for SQL logging during development
     pool_size=5,
     max_overflow=10,
 )
@@ -59,6 +64,11 @@ async def get_async_session() -> AsyncGenerator[AsyncSession, Any]:
 
 async def init_db():
     """Initialize database tables."""
+    # Ensure models are imported so Base.metadata includes all tables.
+    try:
+        import app.aegis.db.models  # noqa: F401
+    except Exception:
+        pass
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     print("Tables initialized")
