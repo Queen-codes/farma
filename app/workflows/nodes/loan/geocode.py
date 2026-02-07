@@ -1,12 +1,45 @@
+"""Loan-flow geocoding node with confidence-based clarification handling.
+
+This module resolves farmer location text into coordinate evidence used by
+satellite and underwriting nodes. It is stricter than climate geocoding:
+low-confidence results trigger follow-up questions before disbursement steps.
+"""
+
 from __future__ import annotations
 
-from app.workflows.language_utils import translate_to_farmer_language
-from app.workflows.state import FarmaState
 from app.workflows.geocode_provenance import geocode_with_provenance
+from app.workflows.geocode_shared import (
+    build_coordinates_from_provenance,
+    needs_location_refinement,
+    resolve_geocode_query,
+    translated_clarifying_question,
+)
 from app.workflows.job_events import emit_event
+from app.workflows.state import FarmaState
 
 
 async def geocoding_node(state: FarmaState) -> dict:
+    """Resolve loan request location and gate downstream loan analysis.
+
+    Args:
+        state: Workflow state with parsed location text and detected language.
+
+    Returns:
+        State update dict containing one of:
+        - `coordinates` and `geocode_provenance` when location is sufficient.
+        - `AWAITING_FARMER_RESPONSE` plus `pending_question` for missing/vague
+          location.
+
+    Raises:
+        Exception: Propagates unexpected geocoding/translation errors.
+
+    Side Effects:
+        Emits geocoding start/completion events.
+        Performs outbound geocoding calls and translation calls when needed.
+
+    Latency:
+        Dominated by external geocoding and translation network round-trips.
+    """
 
     emit_event("geocode_started", step="geocode_location")
 
@@ -14,19 +47,18 @@ async def geocoding_node(state: FarmaState) -> dict:
     language = state.get("language") or "English"
 
     parsed = state.get("parsed_data") or {}
-    query = (
-        parsed.get("geocode_query")
-        or parsed.get("landmark")
-        or state.get("location_query")
-        or state.get("message")
-        or ""
-    ).strip()
+    query = resolve_geocode_query(
+        parsed.get("geocode_query"),
+        parsed.get("landmark"),
+        state.get("location_query"),
+        state.get("message"),
+    )
 
     if not query:
-        q_english = "Please reply with the nearest town/village and a nearby market or junction."
-        q = await translate_to_farmer_language(
-            q_english,
-            language,
+        q = await translated_clarifying_question(
+            provider_question=None,
+            fallback_english="Please reply with the nearest town/village and a nearby market or junction.",
+            language=language,
             context="loan_location_request",
         )
         emit_event(
@@ -45,20 +77,12 @@ async def geocoding_node(state: FarmaState) -> dict:
 
     prov = await geocode_with_provenance(query=query)
     if not prov.get("ok"):
-        q_from_prov = prov.get("clarifying_question")
-        if q_from_prov:
-            q = await translate_to_farmer_language(
-                q_from_prov,
-                language,
-                context="loan_location_clarification",
-            )
-        else:
-            q_fallback = "Please reply with the nearest town/village and a nearby market or junction."
-            q = await translate_to_farmer_language(
-                q_fallback,
-                language,
-                context="loan_location_clarification",
-            )
+        q = await translated_clarifying_question(
+            provider_question=prov.get("clarifying_question"),
+            fallback_english="Please reply with the nearest town/village and a nearby market or junction.",
+            language=language,
+            context="loan_location_clarification",
+        )
         emit_event(
             "geocode_done",
             status="failed",
@@ -74,35 +98,15 @@ async def geocoding_node(state: FarmaState) -> dict:
             "risk_flags": ["LOCATION_VAGUE"],
         }
 
-    coords = {
-        "lat": prov.get("lat"),
-        "lng": prov.get("lng"),
-        "confidence": prov.get("confidence"),
-        "uncertainty_radius_m": prov.get("uncertainty_radius_m"),
-        "suggested_buffer": max(
-            150, min(int(prov.get("uncertainty_radius_m") or 800) // 4, 1000)
-        ),
-        "state": (prov.get("admin") or {}).get("state"),
-        "lga": (prov.get("admin") or {}).get("lga"),
-    }
+    coords = build_coordinates_from_provenance(prov)
 
-    if prov.get("is_vague") or (prov.get("confidence") or 0) < 0.6:
-        q_from_prov = prov.get("clarifying_question")
-        if q_from_prov:
-            q = await translate_to_farmer_language(
-                q_from_prov,
-                language,
-                context="loan_location_refinement",
-            )
-        else:
-            q_fallback = (
-                "Reply with your ward/village and the nearest market or junction."
-            )
-            q = await translate_to_farmer_language(
-                q_fallback,
-                language,
-                context="loan_location_refinement",
-            )
+    if needs_location_refinement(prov):
+        q = await translated_clarifying_question(
+            provider_question=prov.get("clarifying_question"),
+            fallback_english="Reply with your ward/village and the nearest market or junction.",
+            language=language,
+            context="loan_location_refinement",
+        )
         emit_event(
             "geocode_done",
             status="completed",

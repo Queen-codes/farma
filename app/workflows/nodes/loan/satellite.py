@@ -5,7 +5,11 @@ This module;
 
 from __future__ import annotations
 
+import logging
+
 from app.workflows.state import FarmaState
+
+logger = logging.getLogger(__name__)
 
 
 async def satellite_analysis_node(state: FarmaState) -> dict:
@@ -105,16 +109,21 @@ async def satellite_analysis_node(state: FarmaState) -> dict:
         retry_count = coords.get("retry_count", 0)
 
         if current_ndvi is not None and current_ndvi < 0.10:
-            print(
-                f"PIN FAILED (NDVI={current_ndvi:.2f}): "
-                "Likely a building or road. Searching nearby fields..."
+            logger.info(
+                "PIN FAILED (NDVI=%.2f): Likely a building or road. Searching nearby fields...",
+                current_ndvi,
             )
-            snapped_coords, snapped_ndvi = await asyncio.to_thread(
-                field_snap, farm_area
-            )
+            try:
+                snapped_coords, snapped_ndvi = await asyncio.wait_for(
+                    asyncio.to_thread(field_snap, farm_area),
+                    timeout=30.0,
+                )
+            except TimeoutError:
+                logger.warning("field_snap timed out after 30s")
+                snapped_coords, snapped_ndvi = None, 0.0
 
             if snapped_coords and snapped_ndvi > 0.15:
-                print(
+                logger.info(
                     f"FIELD SNAP SUCCESS: Moved to "
                     f"({snapped_coords['lat']:.4f}, {snapped_coords['lng']:.4f}) "
                     f"| New NDVI: {snapped_ndvi:.2f}"
@@ -130,10 +139,10 @@ async def satellite_analysis_node(state: FarmaState) -> dict:
                 if retry_count < 1:
                     risk_flags.append("LOCATION_REVIEW_REQUIRED")
                     coords["retry_count"] = retry_count + 1
-                    print("No vegetation found. Flagging for location review.")
+                    logger.info("No vegetation found. Flagging for location review.")
                 else:
                     risk_flags.append("GHOST_FARM_DETECTED")
-                    print("No vegetation found after retry. Ghost farm detected.")
+                    logger.info("No vegetation found after retry. Ghost farm detected.")
 
         #  Compute z-score — prefer MODIS 10-year, fallback to series
         z_score = (
@@ -229,7 +238,7 @@ async def satellite_analysis_node(state: FarmaState) -> dict:
         }
 
     except Exception as e:
-        print(f"Satellite analysis error: {e}")
+        logger.exception("Satellite analysis error: %s", e)
         emit_event(
             "satellite_done",
             status="failed",

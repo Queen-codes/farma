@@ -1,6 +1,15 @@
-"""
-Docstring for app.workflows.nodes.loan.aegis_context
-This module checks if the farmer's region is in a conflict/crisis zone using AEGIS intelligence data.
+"""AEGIS intelligence for loan underwriting.
+
+This node reads the latest completed AEGIS synthesis records from the database
+and maps state/LGA risk indicators into workflow-ready `aegis_context` and
+derived risk flags.
+
+Used by:
+- `app.workflows.graph` loan branch between satellite analysis and underwriter.
+
+Assumptions:
+- AEGIS tables are migrated and reachable through async SQLAlchemy session.
+- State/LGA names from geocoding are reasonably normalized.
 """
 
 from __future__ import annotations
@@ -12,10 +21,45 @@ from app.workflows.state import FarmaState
 
 
 def _dedupe(flags: List[str]) -> List[str]:
+    """Remove empty/duplicate risk flags while preserving insertion order.
+
+    Args:
+        flags: Candidate risk-flag list.
+
+    Returns:
+        Ordered unique non-empty flags.
+
+    Raises:
+        None.
+
+    Side Effects:
+        None.
+
+    Latency:
+        Linear in input length.
+    """
     return list(dict.fromkeys([f for f in flags if f]))
 
 
 def _flags_from_assessment(assessment: dict, lga_risk: Optional[dict]) -> List[str]:
+    """Derive workflow risk flags from AEGIS assessment metrics.
+
+    Args:
+        assessment: State-level assessment JSON from AEGIS synthesis.
+        lga_risk: Optional LGA-level risk row mapped to dict.
+
+    Returns:
+        List of derived risk flags (deduplicated).
+
+    Raises:
+        None: Invalid metric formats are coerced to safe defaults.
+
+    Side Effects:
+        None.
+
+    Latency:
+        Constant-time local parsing and conditional checks.
+    """
     flags: List[str] = []
 
     risk_level = (assessment.get("risk_level") or "").upper()
@@ -56,7 +100,25 @@ def _flags_from_assessment(assessment: dict, lga_risk: Optional[dict]) -> List[s
 
 
 async def aegis_risk_check_node(state: FarmaState) -> dict:
-    """Inject AEGIS risk context using latest completed synthesis outputs."""
+    """Attach latest AEGIS regional risk context to loan workflow state.
+
+    Args:
+        state: Workflow state expected to include geocoded state/LGA.
+
+    Returns:
+        Dict containing `aegis_context` and newly derived risk flags when
+        available, or an unavailable/error context otherwise.
+
+    Raises:
+        None: Database/query errors are captured and returned in context.
+
+    Side Effects:
+        Performs async database queries against AEGIS tables.
+        Emits lifecycle events for frontend/job timeline updates.
+
+    Latency:
+        Dominated by database access and query execution.
+    """
     emit_event("aegis_started", step="aegis_risk_check")
 
     coords = state.get("coordinates") or {}

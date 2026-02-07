@@ -1,3 +1,16 @@
+"""Google Earth Engine artifact helpers for visualization thumbnails.
+
+Purpose:
+- Generate RGB and NDVI thumbnail URLs for a farm geometry.
+- Provide lightweight visualization metadata for frontend diagnostics.
+
+Used by:
+- `app.workflows.nodes.loan.satellite`.
+
+Assumptions:
+- Earth Engine has already been initialized by caller.
+"""
+
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
@@ -12,7 +25,24 @@ def get_gee_thumbnails(
     farm_area: ee.Geometry,
     end_date: Optional[datetime] = None,
 ) -> Dict[str, Any]:
-    """Return thumbnail URLs for RGB and NDVI composites (no downloads)."""
+    """Return RGB and NDVI thumbnail URLs for a recent Sentinel-2 composite.
+
+    Args:
+        farm_area: Earth Engine geometry region to render.
+        end_date: Optional end date for the 60-day compositing window.
+
+    Returns:
+        Dict[str, Any]: URLs and render parameters for RGB/NDVI thumbnails.
+
+    Raises:
+        Exception: Can propagate Earth Engine API failures.
+
+    Side Effects:
+        Makes Earth Engine API calls to compute composites and thumbnail URLs.
+
+    Latency:
+        Network-bound Earth Engine operations.
+    """
     end_dt = end_date or datetime.now(timezone.utc)
     start_dt = end_dt - timedelta(days=60)
 
