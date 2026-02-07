@@ -1,3 +1,16 @@
+"""Grounded conflict-event collection tool for one Nigerian state.
+
+Purpose:
+- Query grounded web results for recent conflict/security incidents.
+- Parse strict pipe-delimited output into structured event dictionaries.
+
+Used by:
+- `app.aegis.scan.state_worker` via `run_tool_bounded`.
+
+Assumptions:
+- Model follows requested output format with six pipe-separated fields.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
@@ -8,7 +21,9 @@ from app.aegis.scan.grounding import grounded_call_text, extract_grounding_citat
 
 TOOL_NAME = "search_conflict_events"
 
+
 def _parse_pipe_events(text: str, *, state: str) -> list[dict]:
+    """Parse model text lines into structured conflict event rows."""
     events: list[dict] = []
     if not text:
         return events
@@ -42,10 +57,29 @@ def _parse_pipe_events(text: str, *, state: str) -> list[dict]:
 
 async def search_conflict_events(
     *,
-    aclient,
+    aclient: Any,
     state: str,
     timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
+    """Collect and parse grounded conflict events for a state.
+
+    Args:
+        aclient: Authenticated Gemini client instance.
+        state: Target Nigerian state.
+        timeout_s: Optional timeout for grounded model call.
+
+    Returns:
+        Dict[str, Any]: Grounding payload augmented with parsed `data.events`.
+
+    Raises:
+        Exception: Can propagate grounded call failures.
+
+    Side Effects:
+        Performs network/model call.
+
+    Latency:
+        Inference and web-grounding bound.
+    """
     prompt = (
         f"Using Google Search, find recent conflict/security incidents in {state}, Nigeria. "
         "Return a concise bullet list of 5-10 key incidents.\n"

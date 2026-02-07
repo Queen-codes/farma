@@ -1,3 +1,17 @@
+"""Tool registry and bounded execution wrapper for scan grounded tools.
+
+Purpose:
+- Map planner function names to concrete tool coroutines.
+- Enforce global and per-state concurrency limits.
+- Emit structured custom events around tool execution.
+
+Used by:
+- `app.aegis.scan.state_worker`.
+
+Assumptions:
+- Registered tools share a common `(*, aclient, state, timeout_s)` signature.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -23,15 +37,36 @@ async def run_tool_bounded(
     *,
     tool_name: str,
     state: str,
-    aclient,
-    writer,
+    aclient: Any,
+    writer: Callable[[dict[str, Any]], None] | None,
     global_sem: asyncio.Semaphore,
     state_sem: asyncio.Semaphore,
     timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Run a grounded tool call with bounded concurrency and custom events.
 
-    Never raises. Returns a dict payload with {answer_text,sources,spans,data,errors}.
+    Args:
+        tool_name: Registry key for the tool to execute.
+        state: State label passed into the tool.
+        aclient: Authenticated Gemini client instance.
+        writer: Optional LangGraph stream writer callback.
+        global_sem: Cross-process global concurrency semaphore.
+        state_sem: Per-state concurrency semaphore.
+        timeout_s: Optional per-call timeout passed to tool function.
+
+    Returns:
+        Dict[str, Any]: Tool payload with normalized citation/data fields.
+
+    Raises:
+        Does not raise intentionally; execution errors are converted into
+        structured error payloads.
+
+    Side Effects:
+        Emits custom events through writer callback.
+        Makes network/model calls through underlying tool function.
+
+    Latency:
+        Network and inference bound; can queue behind semaphores.
     """
     tool = TOOL_REGISTRY.get(tool_name)
     if tool is None:

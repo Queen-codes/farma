@@ -1,3 +1,17 @@
+"""Grounded food-security signal collection tool.
+
+Purpose:
+- Query grounded humanitarian/agricultural sources for IPC and food-security
+  indicators by state.
+- Normalize key header metrics for downstream synthesis.
+
+Used by:
+- `app.aegis.scan.state_worker` via tool registry.
+
+Assumptions:
+- Model returns requested KEY: VALUE header block.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
@@ -8,7 +22,9 @@ from app.aegis.scan.grounding import grounded_call_text, extract_grounding_citat
 
 TOOL_NAME = "search_food_security"
 
+
 def _parse_kv(answer_text: str) -> dict:
+    """Parse uppercase key/value lines from model text."""
     data: dict = {}
     if not answer_text:
         return data
@@ -24,10 +40,29 @@ def _parse_kv(answer_text: str) -> dict:
 
 async def search_food_security(
     *,
-    aclient,
+    aclient: Any,
     state: str,
     timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
+    """Collect grounded food-security indicators for a state.
+
+    Args:
+        aclient: Authenticated Gemini client instance.
+        state: Target Nigerian state.
+        timeout_s: Optional timeout for grounded model call.
+
+    Returns:
+        Dict[str, Any]: Grounding payload with normalized IPC/food data.
+
+    Raises:
+        Exception: Can propagate grounded call failures.
+
+    Side Effects:
+        Performs network/model call.
+
+    Latency:
+        Inference and grounding bound.
+    """
     prompt = f"""Search for current food security and agricultural conditions in {state} State, Nigeria.
 
 At the VERY TOP, include these KEY: VALUE lines (use 'unknown' if not found):

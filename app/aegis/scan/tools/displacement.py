@@ -1,3 +1,16 @@
+"""Grounded displacement/IDP signal collection tool.
+
+Purpose:
+- Query grounded web sources for IDP trends and movement indicators.
+- Parse top-of-response key/value fields into normalized metrics.
+
+Used by:
+- `app.aegis.scan.state_worker` via tool registry.
+
+Assumptions:
+- Model returns requested KEY: VALUE header block.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
@@ -8,7 +21,9 @@ from app.aegis.scan.grounding import grounded_call_text, extract_grounding_citat
 
 TOOL_NAME = "search_displacement"
 
+
 def _parse_kv(answer_text: str) -> dict:
+    """Parse uppercase key/value lines from model text."""
     data: dict = {}
     if not answer_text:
         return data
@@ -24,10 +39,29 @@ def _parse_kv(answer_text: str) -> dict:
 
 async def search_displacement(
     *,
-    aclient,
+    aclient: Any,
     state: str,
     timeout_s: Optional[float] = None,
 ) -> Dict[str, Any]:
+    """Collect grounded displacement indicators for a state.
+
+    Args:
+        aclient: Authenticated Gemini client instance.
+        state: Target Nigerian state.
+        timeout_s: Optional timeout for grounded model call.
+
+    Returns:
+        Dict[str, Any]: Grounding payload with normalized displacement data.
+
+    Raises:
+        Exception: Can propagate grounded call failures.
+
+    Side Effects:
+        Performs network/model call.
+
+    Latency:
+        Inference and grounding bound.
+    """
     prompt = f"""Search for current information on internally displaced persons (IDPs) in {state} State, Nigeria.
 
 At the VERY TOP, include these KEY: VALUE lines (use 'unknown' if not found):
