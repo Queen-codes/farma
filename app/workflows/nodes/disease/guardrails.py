@@ -1,9 +1,12 @@
-"""Docstring for app.workflows.nodes.disease.guardrails
-This module:
-Detects and blocks harmful or dangerous advice, replacing it with a safe fallback message.
-Uses thresholds to decide when to ask for more information or prompt clarifying questions.
-Flags responses for human verification when risk is high and confidence is low.
-Maps analysis results into system states (e.g., AWAITING_FARMER_RESPONSE) to guide conversation flow.
+"""Deterministic safety and state-transition guardrails for disease advice.
+
+This module post-processes disease model output to:
+- block unsafe treatment content,
+- request clarification when confidence is low,
+- escalate high-risk cases to human verification.
+
+Used by:
+- `app.workflows.graph` directly after disease generation.
 """
 
 from __future__ import annotations
@@ -27,12 +30,47 @@ _UNSAFE_PHRASES = [
 
 
 def _contains_unsafe(text: str) -> bool:
+    """Detect unsafe advice patterns in free-form text.
+
+    Args:
+        text: Candidate advice sentence or SMS content.
+
+    Returns:
+        `True` when any blocked phrase appears, else `False`.
+
+    Raises:
+        None.
+
+    Side Effects:
+        None.
+
+    Latency:
+        Linear in number of blocked phrases.
+    """
     t = (text or "").lower()
     return any(p in t for p in _UNSAFE_PHRASES)
 
 
 async def disease_guardrails(state: FarmaState) -> dict:
-    """Deterministic policy checks + state machine mapping for DISEASE_REPORT and includes LLM-based translation for all farmer-facing messages."""
+    """Apply policy checks to disease output and map to next workflow state.
+
+    Args:
+        state: Workflow state containing disease analysis result and language.
+
+    Returns:
+        Dict with normalized `status`, `risk_flags`, `sms_text`, and optional
+        follow-up question fields for awaiting responses.
+
+    Raises:
+        Exception: Propagates translation helper errors.
+
+    Side Effects:
+        Emits guardrail lifecycle events.
+        May call translation helper for safety/clarification messaging.
+
+    Latency:
+        Mostly local checks; translation calls add network latency.
+    """
     emit_event("disease_guardrails_started", step="disease_guardrails")
 
     analysis = state.get("disease_analysis") or {}

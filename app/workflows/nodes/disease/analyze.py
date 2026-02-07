@@ -32,10 +32,45 @@ DISEASE_SCHEMA = DiseaseAnalysisOutput.model_json_schema()
 
 
 def _clean(value: Any) -> str:
+    """Normalize optional values into trimmed strings.
+
+    Args:
+        value: Any input value from workflow state/model output.
+
+    Returns:
+        Trimmed string representation, or empty string for falsy values.
+
+    Raises:
+        None.
+
+    Side Effects:
+        None.
+
+    Latency:
+        Constant-time local conversion.
+    """
     return str(value or "").strip()
 
 
 def _clip_sms(text: str, limit: int = 160) -> str:
+    """Enforce SMS length cap with ellipsis truncation.
+
+    Args:
+        text: Candidate SMS text.
+        limit: Maximum output length in characters.
+
+    Returns:
+        SMS-safe string not exceeding `limit`.
+
+    Raises:
+        None.
+
+    Side Effects:
+        None.
+
+    Latency:
+        Constant-time string slicing.
+    """
     text = _clean(text)
     if len(text) <= limit:
         return text
@@ -43,6 +78,26 @@ def _clip_sms(text: str, limit: int = 160) -> str:
 
 
 def _build_prompt(*, language: str, crop: str, symptoms: str, message: str) -> str:
+    """Construct structured-output prompt for disease diagnosis call.
+
+    Args:
+        language: Farmer language label.
+        crop: Crop type, if detected.
+        symptoms: Parsed symptom summary, if available.
+        message: Original farmer message text.
+
+    Returns:
+        Prompt string instructing Gemini to return JSON matching schema.
+
+    Raises:
+        None.
+
+    Side Effects:
+        None.
+
+    Latency:
+        Constant-time string composition.
+    """
     return (
         "You are FARMA, a Nigerian farm extension officer.\n"
         "Task: Based on the farmer message, identify likely crop disease/pest and give practical low-cost steps.\n"
@@ -60,7 +115,27 @@ def _build_prompt(*, language: str, crop: str, symptoms: str, message: str) -> s
 
 
 async def disease_generate_once(state: FarmaState) -> dict:
-    """One Gemini Flash call for DISEASE_REPORT."""
+    """Run one disease-analysis generation step with validation/retry.
+
+    Args:
+        state: Workflow state containing farmer message, language, and parsed
+            disease hints.
+
+    Returns:
+        Dict with `disease_analysis`, `analysis_summary`, and `sms_text`.
+        May return clarification prompt when information is insufficient.
+
+    Raises:
+        RuntimeError: If both model attempts fail validation/parsing.
+        Exception: Propagates unrecoverable model/API errors.
+
+    Side Effects:
+        Emits disease lifecycle events.
+        Performs one or more Gemini calls and optional translation call.
+
+    Latency:
+        Dominated by LLM inference and schema-validation retries.
+    """
     emit_event("disease_started", step="disease_generate")
 
     message = _clean(state.get("message"))
