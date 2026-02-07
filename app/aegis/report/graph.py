@@ -1,3 +1,12 @@
+"""LangGraph workflow for end-to-end report generation workflow.
+
+Purpose:
+- aggregates report nodes from input loading through persistence.
+
+Used by:
+- `app.aegis.report.runner.run_report_dag`.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, Optional, TypedDict
@@ -15,11 +24,14 @@ from app.aegis.report.nodes import (
 
 
 class ReportRunState(TypedDict, total=False):
+    """Shared graph state for report generation execution."""
+
     report_id: str
     scan_id: int
     states: list[str]
     include_infographics: bool
     include_annexes: bool
+    simulation_id: Optional[str]
     output_dir: str
 
     report_inputs: Any
@@ -30,7 +42,8 @@ class ReportRunState(TypedDict, total=False):
     status: str
 
 
-def build_report_graph():
+def build_report_graph() -> Any:
+    """Build and compile report DAG graph runnable."""
     g = StateGraph(ReportRunState)
     g.add_node("load_report_inputs", load_report_inputs)
     g.add_node("build_report_data", build_report_data_node)

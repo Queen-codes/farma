@@ -1,3 +1,13 @@
+"""Persistence helpers for report lifecycle rows.
+
+Purpose:
+- Create report rows at job start.
+- Mark completion with artifact paths or failure with errors.
+
+Used by:
+- `app.aegis.report.runner` and `app.aegis.report.nodes`.
+"""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -10,6 +20,7 @@ from app.aegis.db.models import AegisReport
 
 
 def utcnow_naive() -> datetime:
+    """Return current UTC time as naive datetime for DB timestamps."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
@@ -21,6 +32,7 @@ async def create_report_row(
     include_infographics: bool,
     include_annexes: bool,
 ) -> None:
+    """Insert initial report row when one does not already exist."""
     async with get_async_session() as session:
         result = await session.execute(select(AegisReport).where(AegisReport.report_id == report_id))
         existing = result.scalar_one_or_none()
@@ -46,6 +58,7 @@ async def mark_report_completed(
     pdf_path: str,
     gcs_key: Optional[str] = None,
 ) -> None:
+    """Mark report row as completed and attach artifact locations."""
     async with get_async_session() as session:
         result = await session.execute(select(AegisReport).where(AegisReport.report_id == report_id))
         row = result.scalar_one_or_none()
@@ -60,6 +73,7 @@ async def mark_report_completed(
 
 
 async def mark_report_failed(*, report_id: str, error: str) -> None:
+    """Mark report row as failed with error detail."""
     async with get_async_session() as session:
         result = await session.execute(select(AegisReport).where(AegisReport.report_id == report_id))
         row = result.scalar_one_or_none()

@@ -1,10 +1,11 @@
-"""AEGIS Repor
+"""AEGIS report agent entrypoint.
 
-This module generates a PDF report scoped to a scan_id using synthesis outputs persisted in Postgres:
-- aegis_scans.rollup_json
-- aegis_state_intelligence.assessment_json
+Purpose:
+- Expose stable report-generation runner used by API and scheduler code.
 
-
+Flow:
+- `run_report_dag` executes report graph nodes that load synthesis artifacts,
+  generate narrative/infographics, build PDF, and persist report metadata.
 """
 
 from .runner import run_report_dag

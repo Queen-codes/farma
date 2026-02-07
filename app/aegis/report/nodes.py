@@ -1,3 +1,15 @@
+"""Node implementations for the report graph workflow.
+
+Purpose:
+- Load synthesis/simulation artifacts from DB.
+- Build normalized report data payload.
+- Generate narrative, infographics, and PDF.
+- Persist report metadata and optional GCS artifact location.
+
+Used by:
+- `app.aegis.report.graph`.
+"""
+
 from __future__ import annotations
 
 from datetime import datetime, timezone
@@ -11,7 +23,7 @@ from app.aegis.db.connection import get_async_session
 from app.aegis.db.models import AegisScan, StateIntelligence
 from app.aegis.report.config import ReportDAGConfig
 from app.aegis.report.infographics import generate_all_infographics
-from app.aegis.report.narrative import render_template_narrative
+from app.aegis.report.narrative import generate_narrative_llm, render_template_narrative
 from app.aegis.report.pdf import PDFConfig, build_pdf
 from app.aegis.report.persist import create_report_row, mark_report_completed
 from app.aegis.report.report_data import ReportData, ReportInputs, utcnow_iso
@@ -25,6 +37,7 @@ def _emit(
     message: Optional[str] = None,
     payload: Optional[dict] = None,
 ) -> None:
+    """Emit report custom event into LangGraph stream writer."""
     writer = get_stream_writer()
     writer(
         {
@@ -38,9 +51,11 @@ def _emit(
 
 
 async def load_report_inputs(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Load scan rollup and per-state synthesis assessments for report run."""
     report_id = state["report_id"]
     scan_id = int(state["scan_id"])
     states = state.get("states") or []
+    simulation_id = state.get("simulation_id")
 
     _emit(
         "report_started",
@@ -105,18 +120,31 @@ async def load_report_inputs(state: Dict[str, Any]) -> Dict[str, Any]:
             states=states,
             rollup_json=dict(scan.rollup_json),
             assessments_by_state=assessments,
+            simulation=None,
         )
+
+    if simulation_id:
+        try:
+            from app.aegis.simulator.persist import get_simulation as _get_sim
+
+            sim = await _get_sim(str(simulation_id))
+            if sim:
+                inputs.simulation = sim
+        except Exception:
+            # Report remains packaging-only; simulation is optional.
+            pass
 
     _emit(
         "report_data_loaded",
         status="completed",
         step="load_inputs",
-        payload={"scan_id": scan_id, "states": states},
+        payload={"scan_id": scan_id, "states": states, "simulation_id": simulation_id},
     )
     return {"report_inputs": inputs}
 
 
 async def build_report_data_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Construct `ReportData` object and URI whitelist for downstream nodes."""
     inputs: ReportInputs = state["report_inputs"]
     report_id = state["report_id"]
     rd = ReportData(
@@ -126,6 +154,7 @@ async def build_report_data_node(state: Dict[str, Any]) -> Dict[str, Any]:
         states=inputs.states,
         rollup=inputs.rollup_json,
         assessments_by_state=inputs.assessments_by_state,
+        simulation=inputs.simulation,
     )
     rd.build_uri_whitelist()
     _emit(
@@ -138,10 +167,36 @@ async def build_report_data_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def generate_narrative_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate report narrative sections using LLM or template fallback."""
     rd: ReportData = state["report_data"]
     include_annexes = bool(state.get("include_annexes", True))
-    _emit("narrative_started", step="narrative", payload={"scan_id": rd.scan_id})
-    narrative = render_template_narrative(rd, include_annexes=include_annexes)
+    cfg = ReportDAGConfig()
+
+    _emit(
+        "narrative_started",
+        step="narrative",
+        payload={"scan_id": rd.scan_id, "mode": cfg.narrative_mode},
+    )
+
+    if cfg.narrative_mode == "llm":
+        try:
+            narrative = await generate_narrative_llm(
+                rd,
+                include_annexes=include_annexes,
+                thinking_level=cfg.thinking_level,
+                model=cfg.narrative_model,
+            )
+        except Exception as exc:
+            _emit(
+                "narrative_llm_fallback",
+                step="narrative",
+                message=f"LLM narrative failed ({exc}), falling back to template",
+                payload={"scan_id": rd.scan_id},
+            )
+            narrative = render_template_narrative(rd, include_annexes=include_annexes)
+    else:
+        narrative = render_template_narrative(rd, include_annexes=include_annexes)
+
     _emit(
         "narrative_completed",
         status="completed",
@@ -152,6 +207,7 @@ async def generate_narrative_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def generate_infographics_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate infographic assets unless disabled in request state."""
     rd: ReportData = state["report_data"]
     include = bool(state.get("include_infographics", True))
     if not include:
@@ -176,6 +232,7 @@ async def generate_infographics_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def build_pdf_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Render final PDF document from narrative, data, and optional infographics."""
     rd: ReportData = state["report_data"]
     report_id = state["report_id"]
     include_infographics = bool(state.get("include_infographics", True))
@@ -211,6 +268,7 @@ async def build_pdf_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def persist_report_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Persist report row completion and optionally upload artifact to GCS."""
     report_id = state["report_id"]
     scan_id = int(state["scan_id"])
     states = state.get("states") or []
@@ -230,11 +288,27 @@ async def persist_report_node(state: Dict[str, Any]) -> Dict[str, Any]:
         include_infographics=include_infographics,
         include_annexes=include_annexes,
     )
-    await mark_report_completed(report_id=report_id, pdf_path=pdf_path, gcs_key=None)
+
+    gcs_key: str | None = None
+    try:
+        from app.config import GCS_BUCKET, GCS_REPORT_PREFIX
+        from app.utils.gcs_store import upload_bytes
+
+        gcs_key = f"{GCS_REPORT_PREFIX}{Path(pdf_path).name}"
+        upload_bytes(
+            bucket=GCS_BUCKET,
+            key=gcs_key,
+            data=Path(pdf_path).read_bytes(),
+            content_type="application/pdf",
+        )
+    except Exception:
+        gcs_key = None
+
+    await mark_report_completed(report_id=report_id, pdf_path=pdf_path, gcs_key=gcs_key)
     _emit(
         "report_completed",
         status="completed",
         step="report_complete",
-        payload={"scan_id": scan_id, "pdf_path": pdf_path},
+        payload={"scan_id": scan_id, "pdf_path": pdf_path, "gcs_key": gcs_key},
     )
-    return {"status": "completed", "sources_cited": sources_cited}
+    return {"status": "completed", "sources_cited": sources_cited, "gcs_key": gcs_key}

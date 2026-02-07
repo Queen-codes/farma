@@ -1,3 +1,12 @@
+"""Configuration defaults for report narrative/image generation.
+
+Purpose:
+- Define output directories and model defaults for narrative and infographic stages.
+
+Used by:
+- `app.aegis.report.nodes` and `app.aegis.report.infographics`.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -10,15 +19,17 @@ REPORTS_DIR = REPO_ROOT / "reports"
 
 @dataclass(frozen=True)
 class ReportDAGConfig:
-    narrative_mode: str = "template"  # "template" | "llm"
-    thinking_level: str = "LOW"
-    temperature: float = 0.2
+    """Runtime knobs for report narrative and infographic generation."""
+
+    narrative_mode: str = "llm"  # "template" | "llm"
+    narrative_model: str = "gemini-3-flash-preview"
+    thinking_level: str = "low"
+    temperature: float = 0.3
 
     image_model: str = "gemini-3-pro-image-preview"
     image_aspect_ratio: str = "16:9"
-    image_size: str = "2K"
+    image_size: str = "4K"
     image_concurrency: int = 2
 
     cache_dir: Path = REPORTS_DIR / "_aegis_cache" / "infographics"
-    prompt_version: str = "v1"
-
+    prompt_version: str = "v2"
