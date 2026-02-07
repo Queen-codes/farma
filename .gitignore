@@ -9,7 +9,7 @@ wheels/
 # Virtual environments
 .venv
 
-#Api keys
+#Api keys / credentials
 .env
 .env.example
 earth-engine.json
@@ -20,17 +20,11 @@ earth-engine.json
 
 # Logs / local artifacts
 *.log
-api_contract.log
-server.log
 
-#sample test
+#Generated outputs at runtime
 tmp_audio/
-
 reports/
-scripts/
-ref_data/
 
 check_stability.py
 gcs_manager.py
 inspect_schema.py
-start_api.sh
