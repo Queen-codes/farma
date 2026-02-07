@@ -1,12 +1,21 @@
+"""Typed workflow state contract shared across FARMA graph nodes.
+
+Purpose:
+- Define the mutable state object each node reads/writes during execution.
+- Document expected keys for intent parsing, geospatial analysis, risk, and
+  final response generation.
+
+Used by:
+- `app.workflows.graph` and all node modules under `app/workflows/nodes/`.
+"""
+
 from typing import Annotated, Optional, List
 from typing_extensions import TypedDict
 import operator
 
 
 class FarmaState(TypedDict):
-    """
-    The main state for Farma workflow.
-    """
+    """Main LangGraph state for one farmer request pipeline run."""
 
     # Input Data
     phone: str
@@ -21,22 +30,26 @@ class FarmaState(TypedDict):
     ]  # LOAN_REQUEST, DISEASE_REPORT, WEATHER_INQUIRY, HUMAN_ESCALATION
     status: Optional[str]  # READY_FOR_ANALYSIS, AWAITING_FARMER_RESPONSE, COMPLETED
     parsed_data: Optional[dict]  # {crop_type, amount, landmark, symptoms, etc.}
+    pending_question: Optional[str]
+    pending_question_type: Optional[str]
+    human_task: Optional[dict]
+    sms_text: Optional[str]
 
-    # TODO: THIS WAS INTENDED TO BE A SHARED INTELLIGENCE: LOAN EVALUATOR USES ALL THE INFORMATION GOTTEN FROM DIEASES ANALYSIS, CLIMATE TO MAKE A LOAN DECSION
-    # NOT TESTED A LOAN REQUEST WITH A DISEASE REPOROT, But individaul diease report is no longer working as intened, find the root cause and seperate
-    # Disease Engine (Evaluator-Optimizer)
     # Stores: {name, confidence, treatment, risk_flag, iterations}
     disease_analysis: Optional[dict]
 
     # Geospatial Engine
     location_query: Optional[str]  # The raw landmark description
     coordinates: Optional[dict]  # {'lat': float, 'lng': float, 'confidence': float}
+    geocode_provenance: Optional[dict]
 
     # Climate-Smart Shared Data
     # Stores: {ndvi, rainfall_total_30d, soil_moisture, historical_comparison_gap}
+    climate_query: Optional[dict]  # {question_type, time_horizon_days, crop, location_text}
+    weather_forecast: Optional[dict]
+    chirps_rainfall_30d: Optional[float]
     satellite_report: Optional[dict]
     climate_score: Optional[float]  # 0.0 to 1.0 (Health Score)
-    climate_narrative: Optional[str]  # Gemini 3 Pro generated
     risk_flags: Annotated[
         List[str], operator.add
     ]  # ["DROUGHT_RISK", "FLOOD_WARNING", "PEST_LIKELY"]
@@ -46,16 +59,12 @@ class FarmaState(TypedDict):
         dict
     ]  # {zone_name, target_ndvi, expected_seasonality}
     visualization_artifacts: Optional[dict]  # {scatter_plot_path, map_path}
-
-    # Loan Underwriting
-    satellite_score: Optional[
-        float
-    ]  # might not be using for v1, swapped in favor of climate_score, keeping for backward compat, or future updates
-    mobile_money_score: Optional[float]
-    history_score: Optional[float]
+    aegis_context: Optional[dict]
 
     # Final Decisions
     final_decision: Optional[str]  # APPROVED, REJECTED, HELD, ADVICE_ONLY
+    approved_amount: Optional[float]
+    loan_terms: Optional[dict]
     farmer_response: Optional[str]  # The final message to be sent to the farmer
     analysis_summary: Annotated[
         List[str], operator.add

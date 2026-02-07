@@ -1,47 +1,87 @@
+"""LangGraph workflow assembly for FARMA request processing.
+
+This module wires parser nodes, intent routing gates, domain-specific engines,
+and response delivery into one executable graph object (`farma_graph`).
+
+Call flow:
+1. Input route chooses SMS vs voice parser.
+2. Intent gate validates readiness and routes by detected intent.
+3. Intent-specific chains run (loan, disease, climate, or human escalation).
+4. Response aggregation/sending finalizes farmer output and status.
+
+Used by:
+- `app.workflows.runner`, which invokes `farma_graph.astream(...)`.
+"""
+
+import logging
 from typing import Literal
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
 from app.workflows.state import FarmaState
-from app.workflows.nodes.sms_parser import sms_parser_node
-from app.workflows.nodes.voice_parser import voice_parser_node
-from app.workflows.nodes.disease_engine import disease_generator, disease_evaluator
-from app.workflows.nodes.geospatial_engine import (
-    geocoding_node,
-    satellite_analysis_node,
-)
-from app.workflows.nodes.narrative_engine import narrative_orchestration_node
-from app.workflows.nodes.aegis_integration import aegis_risk_check_node
-from app.workflows.nodes.handlers import (
-    loan_decision_node,
-    climate_advisory_handler,
-    weather_handler,
-    human_escalation_handler,
-    awaiting_response_handler,
-)
+from app.workflows.nodes.parsers.sms_parser import sms_parser_node
+from app.workflows.nodes.parsers.voice_parser import voice_parser_node
+from app.workflows.nodes.disease.analyze import disease_generate_once
+from app.workflows.nodes.disease.guardrails import disease_guardrails
+from app.workflows.nodes.climate.geocode import geocode_location_deterministic
+from app.workflows.nodes.climate.forecast import fetch_weather_forecast
+from app.workflows.nodes.climate.chirps import fetch_recent_rainfall_chirps
+from app.workflows.nodes.climate.advisory import gemini_climate_advisory
+from app.workflows.nodes.loan.geocode import geocoding_node
+from app.workflows.nodes.loan.satellite import satellite_analysis_node
+from app.workflows.nodes.loan.aegis_context import aegis_risk_check_node
+from app.workflows.nodes.loan.underwriter import loan_underwriter_node
+from app.workflows.nodes.human.escalation import human_escalation_handler
+from app.workflows.nodes.human.awaiting import awaiting_response_handler
 
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage
-from app.config import GOOGLE_API_KEY, MODEL_FLASH
-
-# flash for aggregator/synthesis
-synthesis_llm = ChatGoogleGenerativeAI(
-    model=MODEL_FLASH, google_api_key=GOOGLE_API_KEY, temperature=0.3
-)
+logger = logging.getLogger(__name__)
 
 
 def route_input(state: FarmaState) -> Literal["sms_parser", "voice_parser"]:
-    """Routes to the correct parser based on input type"""
+    """Choose parser entry node from inbound request type.
+
+    Args:
+        state: Current workflow state containing `input_type`.
+
+    Returns:
+        `"voice_parser"` when `input_type == "voice"`, otherwise `"sms_parser"`.
+
+    Raises:
+        None: Missing/unknown input types default to SMS parser.
+
+    Side Effects:
+        None.
+
+    Latency:
+        Constant-time local routing.
+    """
     if state.get("input_type") == "voice":
         return "voice_parser"
     return "sms_parser"
 
 
 def intent_gate(state: FarmaState) -> dict:
-    """Centralized Gateway for routing and safety logic."""
+    """Transition request status before intent fan-out.
+
+    Args:
+        state: Current workflow state.
+
+    Returns:
+        State update dict. Sets `status` to `ANALYSIS_ONGOING` when parser
+        finished with `READY_FOR_ANALYSIS`; returns empty dict otherwise.
+
+    Raises:
+        None: This gate does not intentionally raise.
+
+    Side Effects:
+        Emits an informational log line when analysis starts.
+
+    Latency:
+        Constant-time local checks.
+    """
     status = state.get("status")
     if status == "READY_FOR_ANALYSIS":
-        print("Request Received. Starting Analysis...")
+        logger.info("Request received. Starting analysis.")
         # Return dict with update - don't mutate state directly
         return {"status": "ANALYSIS_ONGOING"}
 
@@ -54,12 +94,28 @@ def route_by_intent(
 ) -> Literal[
     "geocoding_node",
     "satellite_analysis_node",
-    "disease_generator",
-    "weather",
+    "disease_generate_once",
+    "climate_geocode",
     "human",
     "awaiting",
 ]:
-    """Routes to the appropriate engine based on intent"""
+    """Route parsed request into intent-specific workflow branch.
+
+    Args:
+        state: Current workflow state with `intent`, `status`, and coordinates.
+
+    Returns:
+        Node name for the next step in graph execution.
+
+    Raises:
+        None: Unknown intents are routed to `"human"`.
+
+    Side Effects:
+        None.
+
+    Latency:
+        Constant-time dictionary routing.
+    """
 
     if state.get("status") == "AWAITING_FARMER_RESPONSE":
         # TOOO: Action update if we havent heard from them in 72 hours to let them know we're still waiting to hear from them.
@@ -67,118 +123,80 @@ def route_by_intent(
 
     intent = state.get("intent", "HUMAN_ESCALATION")
 
-    # Byp geocoding if coordinates already exist(For farmers who might be able to drop a whatsapp pin)
+    # Byp geocoding if coordinates already exist(For farmers who might be able to drop a whatsapp pin or returning farmers)
     if intent == "LOAN_REQUEST" and state.get("coordinates"):
         return "satellite_analysis_node"
 
     route_map = {
         "LOAN_REQUEST": "geocoding_node",
-        "DISEASE_REPORT": "disease_generator",
-        "WEATHER_INQUIRY": "weather",
+        "DISEASE_REPORT": "disease_generate_once",
+        "WEATHER_INQUIRY": "climate_geocode",
         "HUMAN_ESCALATION": "human",
     }
     return route_map.get(intent, "human")
 
 
-def route_disease_evaluation(
-    state: FarmaState,
-) -> Literal["disease_generator", "response_aggregator"]:
-    """Optimizer Loop: Decide whether to re-run or finish."""
-    analysis = state.get("disease_analysis", {})
-    if analysis.get("is_verified") or analysis.get("iterations", 0) >= 2:
-        return "response_aggregator"
-    return "disease_generator"
-
-
 def response_aggregator(state: FarmaState) -> dict:
-    lang = state.get("language", "English")
-    parsed = state.get("parsed_data", {})
-    advisories = state.get("analysis_summary", [])
-    intent = state.get("intent", "LOAN_REQUEST")
-    decision = state.get("final_decision", "REVIEW")
-    zone = state.get("nigeria_aez_context", {}).get("zone_name", "your area")
+    """Normalize downstream response text into one SMS-safe output field.
 
-    context = "\n- ".join(advisories)
+    Args:
+        state: Current workflow state that may include `sms_text` and/or
+            `farmer_response`.
 
-    if intent == "DISEASE_REPORT":
-        prompt = f"""
-        You are a digital agricultural officer in Nigeria.
-        Language: {lang}
-        Intent: Plant Disease Report
-        Advice to include: {context}
-        
-        Task: Write a single, unified SMS in {lang}. 
-        Tone: Empathetic, professional, and clear. 
-        Constraint: Max 160 characters (Standard SMS length). 
-        Acknowledge the disease diagnosis and provide the specific treatment steps from the context.
-        """
-    else:
-        prompt = f"""
-        You are a digital agricultural officer in Nigeria.
-        Language: {lang}
-        Region: {zone}
-        Loan Decision: {decision}
-        Advice to include: {context}
-        
-        Task: Write a single, unified SMS in {lang}. 
-        Tone: Professional, clear, and encouraging. 
-        Constraint: Max 160 characters (Standard SMS length). 
-        If approved, tell them next steps. If rejected, provide the specific agronomic advice from the context.
-        IMPORTANT: Do NOT ask the farmer for rainfall data or any technical measurements. If you need clarification, ask for a simple landmark/village name or a WhatsApp GPS pin.
-        """
+    Returns:
+        Dict with normalized `farmer_response` capped at 160 characters.
 
-    try:
-        print("Calling synthesis LLM...")
-        response = synthesis_llm.invoke([HumanMessage(content=prompt)])
-        print("Synthesis complete.")
+    Raises:
+        None: This function does not intentionally raise.
 
-        # Handle cases where response.content is a list (Gemini parts)
-        if isinstance(response.content, list):
-            response_text = " ".join(
-                [
-                    part.get("text", "") if isinstance(part, dict) else str(part)
-                    for part in response.content
-                ]
-            )
-        else:
-            response_text = str(response.content)
+    Side Effects:
+        None.
 
-        response_text = response_text.strip()
-    except Exception as e:
-        print(f"Error in response generation: {e}")
-        response_text = f"Farma Update: Your loan for {zone} is under status {decision}. Advice: {context[:50]}"
-
-    return {"farmer_response": response_text}
+    Latency:
+        Constant-time string handling only.
+    """
+    sms_text = (state.get("sms_text") or "").strip()
+    farmer_response = (state.get("farmer_response") or "").strip()
+    out = sms_text or farmer_response
+    out = out.strip()
+    if len(out) > 160:
+        out = out[:157].rstrip() + "..."
+    return {"farmer_response": out}
 
 
 def sms_sender_node(state: FarmaState) -> dict:
+    """Emit response delivery events and finalize workflow status.
+
+    Args:
+        state: Current workflow state containing phone and outgoing response.
+
+    Returns:
+        Empty dict when workflow should remain in waiting/human-verification
+        states, otherwise `{"status": "COMPLETED"}`.
+
+    Raises:
+        None: Event emission failures are handled by downstream utilities.
+
+    Side Effects:
+        Emits `response_started/response_done` custom events and writes logs.
+        Imports `emit_event` lazily to avoid cyclic imports at module load.
+
+    Latency:
+        Local event/log emission; external SMS integration is currently mocked.
     """
-    handles the sending of of messages to farmers
-    Simulates sending via Twilio/Africa's Talking.
-    """
-    # TODO: make this the only source of thruth for sending sms, no matter the intent, if you want to send a message either for more deets, or actual response fufuilled
+    from app.workflows.job_events import emit_event
+
+    emit_event("response_started", step="response")
     response = state.get("farmer_response")
     phone = state.get("phone")
 
-    print(f"sms sending starting now")
-    print(f"TO: {phone}")
-    print(f"MESSAGE: {response}")
-    print(f"sent..")
+    logger.info("SMS send initiated: phone=%s message=%s", phone, response)
 
+    emit_event("response_done", status="completed", step="response")
+    existing_status = state.get("status")
+    if existing_status in {"AWAITING_FARMER_RESPONSE", "NEEDS_HUMAN_VERIFICATION"}:
+        return {}
     return {"status": "COMPLETED"}
-
-
-def route_satellite_results(
-    state: FarmaState,
-) -> Literal["geocoding_node", "aegis_risk_check"]:
-    """Implements the redirection if water/barren detected."""
-    risk_flags = state.get("risk_flags", [])
-    if "LOCATION_REVIEW_REQUIRED" in risk_flags:
-        print(
-            "REDIRECT: Location review required. Retrying geocoding with offset logic."
-        )
-        return "geocoding_node"
-    return "aegis_risk_check"  # route to Aegis check before credit decision
 
 
 # build graph
@@ -193,78 +211,51 @@ builder.add_node("intent_gate", intent_gate)
 builder.add_node("geocoding_node", geocoding_node)
 builder.add_node("satellite_analysis_node", satellite_analysis_node)
 builder.add_node("aegis_risk_check", aegis_risk_check_node)  # Aegis integration
-builder.add_node("narrative_orchestration", narrative_orchestration_node)
-builder.add_node("disease_generator", disease_generator)
-builder.add_node("disease_evaluator", disease_evaluator)
+builder.add_node("loan_underwriter", loan_underwriter_node)
+builder.add_node("disease_generate_once", disease_generate_once)
+builder.add_node("disease_guardrails", disease_guardrails)
+
+# Climate nodes (WEATHER_INQUIRY)
+builder.add_node("climate_geocode", geocode_location_deterministic)
+builder.add_node("weather_fetch", fetch_weather_forecast)
+builder.add_node("chirps_rainfall", fetch_recent_rainfall_chirps)
+builder.add_node("climate_advisory", gemini_climate_advisory)
 
 # Handlers
-builder.add_node("loan_decision", loan_decision_node)
-builder.add_node("climate_advisory", climate_advisory_handler)
-builder.add_node("weather", weather_handler)
 builder.add_node("human", human_escalation_handler)
 builder.add_node("awaiting", awaiting_response_handler)
 builder.add_node("response_aggregator", response_aggregator)
 builder.add_node("sms_sender", sms_sender_node)
 
 # Edges
-builder.add_conditional_edges(
-    START, route_input, {"sms_parser": "sms_parser", "voice_parser": "voice_parser"}
-)
+builder.add_conditional_edges(START, route_input)
 builder.add_edge("sms_parser", "intent_gate")
 builder.add_edge("voice_parser", "intent_gate")
 
-builder.add_conditional_edges(
-    "intent_gate",
-    route_by_intent,
-    {
-        "geocoding_node": "geocoding_node",
-        "satellite_analysis_node": "satellite_analysis_node",
-        "disease_generator": "disease_generator",
-        "weather": "weather",
-        "human": "human",
-        "awaiting": "awaiting",
-    },
-)
+builder.add_conditional_edges("intent_gate", route_by_intent)
 
-# Loan Flow: Geocoding -> Satellite -> (Conditional Route) -> Narrative -> Decision -> Advisory -> Response -> Sender
-# loan_decision and climate_advisory run sequentially to avoid fan-in deadlock at response_aggregator.
+# Loan Flow: Geocoding -> Satellite -> AEGIS -> Underwriter -> Sender
 builder.add_edge("geocoding_node", "satellite_analysis_node")
-builder.add_conditional_edges(
-    "satellite_analysis_node",
-    route_satellite_results,
-    {
-        "geocoding_node": "geocoding_node",
-        "aegis_risk_check": "aegis_risk_check",  # Route to Aegis check
-    },
-)
-builder.add_edge(
-    "aegis_risk_check", "narrative_orchestration"
-)  # Aegis -> Credit Decision
-builder.add_edge("narrative_orchestration", "loan_decision")
-builder.add_edge("loan_decision", "climate_advisory")
-builder.add_edge("climate_advisory", "response_aggregator")
+builder.add_edge("satellite_analysis_node", "aegis_risk_check")
+builder.add_edge("aegis_risk_check", "loan_underwriter")
+builder.add_edge("loan_underwriter", "sms_sender")
+
+# Disease Flow: one-call -> guardrails -> response -> sender
+builder.add_edge("disease_generate_once", "disease_guardrails")
+builder.add_edge("disease_guardrails", "response_aggregator")
 builder.add_edge("response_aggregator", "sms_sender")
 
-# Disease Loop
-builder.add_edge("disease_generator", "disease_evaluator")
-builder.add_conditional_edges(
-    "disease_evaluator",
-    route_disease_evaluation,
-    {
-        "disease_generator": "disease_generator",
-        "response_aggregator": "response_aggregator",
-    },
-)
+# Climate Flow: geocode -> (forecast + chirps in parallel) -> advisory -> response -> sender
+builder.add_edge("climate_geocode", "weather_fetch")
+builder.add_edge("climate_geocode", "chirps_rainfall")
+builder.add_edge(["weather_fetch", "chirps_rainfall"], "climate_advisory")
+builder.add_edge("climate_advisory", "response_aggregator")
 
 # Termination
-builder.add_edge("weather", "response_aggregator")
-builder.add_edge("human", END)
-builder.add_edge("awaiting", END)
+builder.add_edge("human", "response_aggregator")
+builder.add_edge("awaiting", "sms_sender")
 builder.add_edge("sms_sender", END)
 
 # Compile with Memory
 memory = MemorySaver()
 farma_graph = builder.compile(checkpointer=memory)
-
-# TODO: ENSURE PERSISTENCE 1. IF A FARMER TAKES longer than 72 hours to reply, send a message reminding them of their reply and resend the message you sent initially, incase they missed it
-# also whenever a famer responds, remeber the farmer an d pick up from the exact flow
