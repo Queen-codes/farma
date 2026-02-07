@@ -24,17 +24,12 @@ api_contract.log
 server.log
 
 #sample test
-tests/
 tmp_audio/
 
 reports/
 scripts/
 ref_data/
 
-# Legacy / local demo UI (backend-first repo)
-streamlit_app/
-
-docs/
 check_stability.py
 gcs_manager.py
 inspect_schema.py
