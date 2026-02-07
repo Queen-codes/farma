@@ -5,6 +5,7 @@ load_dotenv()
 
 # API Keys
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+API_KEY = os.getenv("API_KEY")
 
 # Earth Engine Settings
 service_account = os.getenv("service_account")
@@ -22,7 +23,7 @@ GEMINI_MODEL_GROUNDED = os.getenv("GEMINI_MODEL_GROUNDED", "gemini-3-flash-previ
 GEMINI_MODEL_SYNTH = os.getenv("GEMINI_MODEL_SYNTH", "gemini-3-flash-preview")
 
 # Thinking
-THINKING_LEVEL = os.getenv("THINKING_LEVEL", "LOW")
+THINKING_LEVEL = os.getenv("THINKING_LEVEL", "low")
 
 # Concurrency
 MAX_STATE_WORKERS = int(
