@@ -21,6 +21,14 @@ def _base_url() -> str:
     return os.getenv("FARMA_API_URL", "http://localhost:8000").rstrip("/")
 
 
+def _auth_headers() -> Dict[str, str]:
+    """Build auth headers from API_AUTH_TOKEN env var when set."""
+    token = os.getenv("API_AUTH_TOKEN", "").strip()
+    if token:
+        return {"Authorization": f"Bearer {token}"}
+    return {}
+
+
 def _req(method: str, path: str, **kwargs) -> requests.Response:
     """Send one HTTP request and enforce non-error status.
 
@@ -37,7 +45,8 @@ def _req(method: str, path: str, **kwargs) -> requests.Response:
         requests.RequestException: For transport-level failures.
     """
     url = f"{_base_url()}{path}"
-    resp = requests.request(method, url, timeout=30, **kwargs)
+    headers = {**_auth_headers(), **kwargs.pop("headers", {})}
+    resp = requests.request(method, url, timeout=30, headers=headers, **kwargs)
     resp.raise_for_status()
     return resp
 

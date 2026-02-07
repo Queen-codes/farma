@@ -243,7 +243,9 @@ def _extract_location_query(message: str) -> str:
     text = (message or "").strip()
     if not text:
         return ""
-    m = re.search(r"\b(?:at|near|in)\s+([^.,;]+)", text, re.I)
+    # Match English (at/near/in/from) and Nigerian-language prepositions:
+    #   Yoruba "ni", Igbo "na", Pidgin "for"
+    m = re.search(r"\b(?:at|near|in|from|ni|na|for)\s+([^.,;]+)", text, re.I)
     if m:
         return m.group(1).strip()
     return ""
@@ -270,7 +272,14 @@ def _fallback_parse(message: str) -> dict:
     text = (message or "").strip()
     text_l = text.lower()
     intent = "HUMAN_ESCALATION"
-    if any(t in text_l for t in ("loan", "borrow", "credit", "naira", "n", "owo", "kudi", "kuɗi")):
+    # Use word-boundary regex for short tokens to avoid false positives
+    # (e.g. bare "n" previously matched any text containing the letter n).
+    _loan_keywords = re.compile(
+        r"\b(?:loan|borrow|credit|naira|owo|kudi|kuɗi)\b"
+        r"|(?:₦)\s*[0-9]",
+        re.I,
+    )
+    if _loan_keywords.search(text_l):
         intent = "LOAN_REQUEST"
     elif any(t in text_l for t in ("disease", "spots", "yellow", "wilt", "leaf", "symptom", "pest")):
         intent = "DISEASE_REPORT"

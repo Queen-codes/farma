@@ -257,5 +257,8 @@ builder.add_edge("awaiting", "sms_sender")
 builder.add_edge("sms_sender", END)
 
 # Compile with Memory
+# MemorySaver is in-process only. Human-interrupt checkpoints are lost
+# on restart. For production, to be replace with langgraph-checkpoint-postgres
+# (AsyncPostgresSaver) backed by DATABASE_URL.
 memory = MemorySaver()
 farma_graph = builder.compile(checkpointer=memory)

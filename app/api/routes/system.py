@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 from datetime import timezone
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 
 from app.api.schemas import HealthResponse
 from app.utils.thinking_bus import thinking_bus
@@ -141,6 +141,8 @@ async def thinking_stream(websocket: WebSocket) -> None:
 
     Request:
         WebSocket upgrade request to `/ws/thinking`.
+        Token is passed as a `token` query parameter (WebSocket connections
+        cannot use HTTP headers for auth in browsers).
         Incoming text frames are accepted as keepalive/flow-control signals.
 
     Response:
@@ -149,13 +151,11 @@ async def thinking_stream(websocket: WebSocket) -> None:
 
     Status Codes:
         WebSocket handshake semantics apply (HTTP 101 on successful upgrade).
+        Connection is closed with 1008 (Policy Violation) if auth fails.
 
     Auth:
-        No auth dependency is currently enforced for this socket endpoint.
-
-    Idempotency:
-        Not idempotent; behavior depends on live stream state and connection
-        lifecycle.
+        Requires valid API token via `?token=` query parameter when
+        API_AUTH_ENABLED is true.
 
     Args:
         websocket: Active WebSocket connection object from FastAPI.
@@ -172,6 +172,17 @@ async def thinking_stream(websocket: WebSocket) -> None:
     Latency:
         Long-lived streaming connection; runtime depends on connection duration.
     """
+    # Authenticate before accepting the connection
+    auth_enabled = os.getenv("API_AUTH_ENABLED", "true").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    if auth_enabled:
+        expected = (os.getenv("API_AUTH_TOKEN") or "").strip()
+        provided = (websocket.query_params.get("token") or "").strip()
+        if not expected or provided != expected:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
+
     await thinking_bus.connect(websocket)
     try:
         while True:
