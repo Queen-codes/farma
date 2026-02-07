@@ -1,0 +1,15 @@
+.venv
+__pycache__
+*.py[oc]
+.git
+.env
+.env.example
+earth-engine.json
+.DS_Store
+*.log
+reports/
+tmp_audio/
+tests/
+docs/
+.pytest_cache
+*.egg-info
