@@ -1,3 +1,18 @@
+"""Per-state scan worker node: planner, bounded tools, synthesis, persistence.
+
+Purpose:
+- Execute one state's scan lifecycle inside LangGraph node execution.
+- Emit granular custom events for UI/job timelines.
+- Persist incremental state intelligence for near-real-time API updates.
+
+Used by:
+- `app.aegis.scan.graph` as the only worker node.
+
+Assumptions:
+- Inputs contain `state`, `api_key`, and `days_back`.
+- Tool registry functions return normalized grounding payloads.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -26,6 +41,7 @@ _GLOBAL_TOOL_SEM: asyncio.Semaphore | None = None
 
 
 def _global_tool_sem() -> asyncio.Semaphore:
+    """Lazily initialize process-wide semaphore for total tool concurrency."""
     global _GLOBAL_TOOL_SEM
     if _GLOBAL_TOOL_SEM is None:
         _GLOBAL_TOOL_SEM = asyncio.Semaphore(max(1, int(GLOBAL_TOOL_CONCURRENCY)))
@@ -33,9 +49,24 @@ def _global_tool_sem() -> asyncio.Semaphore:
 
 
 async def aegis_state_worker(inputs: dict) -> dict:
-    """LangGraph node: plan → run grounded tools (bounded, concurrent) → synthesize.
+    """Run one state worker pass: planning, tool collection, and synthesis.
 
-    Emits custom events via LangGraph stream writer.
+    Args:
+        inputs: Node input payload including state, api key, days_back, and scan_id.
+
+    Returns:
+        dict: Node output with single-entry `results` list.
+
+    Raises:
+        Does not raise intentionally for planner/tool errors; errors are returned
+        as result payloads and custom events.
+
+    Side Effects:
+        Emits custom stream events, performs model/network calls, and optionally
+        writes state intelligence rows to DB.
+
+    Latency:
+        Potentially high due to planner + multiple grounded tool calls.
     """
     writer = get_stream_writer()
 
@@ -129,7 +160,9 @@ async def aegis_state_worker(inputs: dict) -> dict:
 
     aclient = genai.Client(api_key=api_key)
 
-    async def _run_call(fc) -> tuple[str, Dict[str, Any]]:
+    async def _run_call(fc: Any) -> tuple[str | None, str, Dict[str, Any]]:
+        """Execute one planned function call via bounded tool wrapper."""
+        call_id = getattr(fc, "id", None)
         tool_name = fc.name or ""
         args = getattr(fc, "args", None) or getattr(fc, "arguments", None) or {}
         call_state = args.get("state") or args.get("region") or state
@@ -142,7 +175,7 @@ async def aegis_state_worker(inputs: dict) -> dict:
             state_sem=state_sem,
             timeout_s=GEMINI_TIMEOUT_S,
         )
-        return tool_name, result
+        return str(call_id) if call_id is not None else None, tool_name, result
 
     tasks = [_run_call(fc) for fc in plan.function_calls]
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
@@ -151,8 +184,11 @@ async def aegis_state_worker(inputs: dict) -> dict:
     for item in gathered:
         if isinstance(item, Exception):
             continue
-        name, result = item
-        tool_results[name] = result
+        call_id, name, result = item
+        if call_id:
+            tool_results[call_id] = result
+        if name and name not in tool_results:
+            tool_results[name] = result
 
     # persist immediately for incremental UI updates (optional, requires scan_id)
     if scan_id:

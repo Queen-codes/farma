@@ -1,7 +1,23 @@
+"""Gemini function-calling adapter used by the scan state worker.
+
+Purpose:
+- Encapsulate planner and synthesis calls against the Gemini API.
+- Preserve planner model content so function-response replay follows expected
+  tool-calling conversation format.
+- Provide bounded retry and timeout handling for model calls.
+
+Used by:
+- `app.aegis.scan.state_worker.aegis_state_worker`.
+
+Assumptions:
+- Valid Google API key is provided by caller.
+- Function declarations and tool result payloads follow Gemini SDK shapes.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar
 
 from google import genai
 from google.genai import types
@@ -10,9 +26,14 @@ import asyncio
 
 @dataclass
 class Plan:
+    """Planner output envelope reused by synthesis stage."""
+
     prompt: str
     model_content: Any
     function_calls: List[types.FunctionCall]
+
+
+_T = TypeVar("_T")
 
 
 class Gemini3Adapter:
@@ -26,7 +47,30 @@ class Gemini3Adapter:
         thinking_level: str = "LOW",
         timeout_s: float | None = None,
         max_retries: int = 0,
-    ):
+    ) -> None:
+        """Initialize adapter with model routing and resilience settings.
+
+        Args:
+            api_key: Gemini API key.
+            model_planner: Model name used for tool-planning call.
+            model_grounded: Reserved grounded model identifier (kept for config parity).
+            model_synth: Model name used for post-tool synthesis call.
+            thinking_level: Gemini thinking level (`LOW`, `MEDIUM`, `HIGH`).
+            timeout_s: Optional per-call timeout in seconds.
+            max_retries: Retry count for transient model-call failures.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: Can propagate from invalid retry coercion inputs.
+
+        Side Effects:
+            Creates a Gemini client instance.
+
+        Latency:
+            Constant-time object initialization.
+        """
         self.client = genai.Client(api_key=api_key)
         self.model_planner = model_planner
         self.model_grounded = model_grounded
@@ -35,7 +79,26 @@ class Gemini3Adapter:
         self.timeout_s = timeout_s
         self.max_retries = max(0, int(max_retries))
 
-    async def _call_with_retry(self, coro_factory):
+    async def _call_with_retry(
+        self, coro_factory: Callable[[], Awaitable[_T]]
+    ) -> _T:
+        """Execute an async Gemini call with timeout + exponential backoff retries.
+
+        Args:
+            coro_factory: Zero-arg callable that returns a fresh awaitable per attempt.
+
+        Returns:
+            _T: Result returned by the awaited coroutine.
+
+        Raises:
+            Exception: Re-raises final exception after retries are exhausted.
+
+        Side Effects:
+            Performs sleeps between retries.
+
+        Latency:
+            Network-bound model call latency plus retry backoff delays.
+        """
         attempt = 0
         last_exc: Exception | None = None
         while attempt <= self.max_retries:
@@ -60,7 +123,25 @@ class Gemini3Adapter:
         prompt: str,
         function_declarations: list[types.FunctionDeclaration],
     ) -> Plan:
-        """Planner turn (no grounding): returns multiple functionCall parts in one response."""
+        """Run planner turn and extract requested tool calls.
+
+        Args:
+            prompt: Planner instruction text.
+            function_declarations: Available tool declarations for function calling.
+
+        Returns:
+            Plan: Planner content and ordered function call list.
+
+        Raises:
+            RuntimeError: If Gemini returns no candidates or no function calls.
+            Exception: Can propagate transport/model-call failures.
+
+        Side Effects:
+            Makes network call to Gemini API.
+
+        Latency:
+            Depends on model inference and network latency.
+        """
         resp = await self._call_with_retry(
             lambda: self.client.aio.models.generate_content(
                 model=self.model_planner,
@@ -102,12 +183,35 @@ class Gemini3Adapter:
         plan: Plan,
         tool_results: Dict[str, Any],
     ) -> list[types.Part]:
-        """Build FunctionResponse parts in the same order as the function calls."""
+        """Build `function_response` parts matching planner call order.
+
+        Args:
+            plan: Planner output with ordered function calls.
+            tool_results: Tool payloads keyed by call ID and/or function name.
+
+        Returns:
+            list[types.Part]: Ordered function-response parts for synthesis turn.
+
+        Raises:
+            Does not raise intentionally.
+
+        Side Effects:
+            None.
+
+        Latency:
+            Linear in number of function calls.
+        """
         parts: list[types.Part] = []
         for call in plan.function_calls:
             name = call.name or ""
             call_id = call.id
-            response_payload = tool_results.get(name, {"error": "missing_tool_result"})
+            response_payload = None
+            if call_id is not None:
+                response_payload = tool_results.get(str(call_id))
+            if response_payload is None:
+                response_payload = tool_results.get(name)
+            if response_payload is None:
+                response_payload = {"error": "missing_tool_result"}
             fr = types.FunctionResponse(
                 id=call_id, name=name, response=response_payload
             )
@@ -121,7 +225,25 @@ class Gemini3Adapter:
         tool_results: Dict[str, Any],
         synth_prompt: str,
     ) -> str:
-        """Synthesis turn: preserve exact planner model content, then provide all functionResponses."""
+        """Run synthesis turn using planner context and tool responses.
+
+        Args:
+            plan: Planner output containing original model content.
+            tool_results: Tool payloads keyed by call ID/name.
+            synth_prompt: Final synthesis instruction text.
+
+        Returns:
+            str: Combined text output from synthesis model response.
+
+        Raises:
+            Exception: Can propagate model-call failures.
+
+        Side Effects:
+            Makes network call to Gemini API.
+
+        Latency:
+            Depends on model inference and network latency.
+        """
         # Turn structure (NO INTERLEAVING):
         # 1) user prompt text content
         # 2) EXACT model content from Turn 1 (candidate.content, unchanged)
@@ -134,7 +256,8 @@ class Gemini3Adapter:
         contents = [
             types.Content(role="user", parts=[types.Part(text=synth_prompt)]),
             plan.model_content,
-            types.Content(role="user", parts=function_response_parts),
+            # Gemini function-calling history expects function responses as tool turns.
+            types.Content(role="tool", parts=function_response_parts),
         ]
 
         resp = await self._call_with_retry(

@@ -1,3 +1,18 @@
+"""Runner wrapper for executing the compiled scan graph and finalizing scan DB state.
+
+Purpose:
+- Execute `aegis_scan_graph` with concurrency limits.
+- Forward graph custom events to job-store timeline events.
+- Finalize persisted scan aggregates (`states_scanned`, fatalities, LGA risk).
+
+Used by:
+- `app.aegis.graph.run_aegis_scan`.
+- Scheduler and API layers that trigger scan runs.
+
+Assumptions:
+- `scan_id` points to an existing `AegisScan` row when finalization is desired.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
@@ -16,7 +31,29 @@ async def run_aegis_scan(
     scan_id: int | None = None,
     emit_job_events: bool = True,
 ) -> Dict[str, Any]:
-    """Run scan (Gemini-native) and optionally forward LangGraph custom events into job_store."""
+    """Run a full scan graph invocation and return summary metrics.
+
+    Args:
+        api_key: Gemini API key used by per-state workers.
+        states: States to process in this run.
+        days_back: Lookback window used by grounded tools.
+        run_id: External run identifier.
+        scan_id: Optional persisted scan row ID for finalize step.
+        emit_job_events: Whether to mirror custom events to `job_store`.
+
+    Returns:
+        Dict[str, Any]: Run summary with status, totals, and state results.
+
+    Raises:
+        Exception: Can propagate graph execution failures.
+
+    Side Effects:
+        Reads/writes job events, executes model/network calls through workers,
+        and mutates scan DB totals when `scan_id` is provided.
+
+    Latency:
+        Potentially high due to parallel grounded model/tool execution.
+    """
     job_store = None
     if emit_job_events:
         try:
@@ -38,6 +75,7 @@ async def run_aegis_scan(
     final_state: Optional[dict] = None
 
     async def _maybe_emit(custom: dict) -> None:
+        """Forward one custom graph event to the shared job store."""
         if not job_store:
             return
         try:

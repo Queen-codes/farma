@@ -1,3 +1,18 @@
+"""Persistence helpers for scan-stage outputs and aggregate finalization.
+
+Purpose:
+- Persist per-state tool payloads and derived conflict rows incrementally.
+- Finalize scan totals and compute LGA risk score rows.
+
+Used by:
+- `app.aegis.scan.state_worker` (incremental state persistence).
+- `app.aegis.scan.runner` (scan finalization step).
+
+Assumptions:
+- `scan_id` references an existing `AegisScan` row.
+- Tool payloads follow expected keys (`data.events`, `errors`, etc.).
+"""
+
 from __future__ import annotations
 
 from collections import defaultdict
@@ -16,10 +31,12 @@ from app.aegis.db.models import (
 
 
 def _utcnow_naive() -> datetime:
+    """Return current UTC time as naive datetime for DB writes."""
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def _risk_level(score: int) -> str:
+    """Map numeric LGA risk score to categorical level."""
     if score >= 25:
         return "CRITICAL"
     if score >= 15:
@@ -35,13 +52,25 @@ async def persist_state_intelligence(
     state_name: str,
     tool_results: Dict[str, Any],
 ) -> dict:
-    """Persist one state's scan outputs immediately.
+    """Persist one state's raw tool outputs and derived conflict events.
 
-    Writes:
-    - StateIntelligence row (raw JSONB tool outputs)
-    - ConflictEvent rows (from tool_results['search_conflict_events'].data.events if present)
+    Args:
+        scan_id: Parent scan ID.
+        state_name: State label for this worker output.
+        tool_results: Tool payload mapping keyed by function name/call ID.
 
-    Idempotent for (scan_id, state_name): replaces prior rows.
+    Returns:
+        dict: Lightweight summary containing state name, event count, fatalities.
+
+    Raises:
+        SQLAlchemyError: Can propagate if DB writes fail.
+
+    Side Effects:
+        Deletes/replaces prior `StateIntelligence` + `ConflictEvent` rows for the
+        same `(scan_id, state_name)` tuple.
+
+    Latency:
+        Depends on number of events persisted for the state.
     """
     conflict = tool_results.get("search_conflict_events") or {}
     displacement = tool_results.get("search_displacement") or {}
@@ -139,7 +168,23 @@ async def finalize_scan(
     *,
     scan_id: int,
 ) -> dict:
-    """Finalize scan: mark AegisScan completed and store LGA risk scores."""
+    """Finalize a scan run and compute aggregate totals + LGA risk rows.
+
+    Args:
+        scan_id: Scan row primary key.
+
+    Returns:
+        dict: Finalized totals (`states_scanned`, events, fatalities).
+
+    Raises:
+        SQLAlchemyError: Can propagate on query/update/insert failures.
+
+    Side Effects:
+        Updates `AegisScan` status/totals and replaces all scan `LGARiskScore` rows.
+
+    Latency:
+        Can be moderate/high for scans with large conflict-event volumes.
+    """
     async with async_session() as session:
         # Update scan totals
         intel_rows = await session.execute(

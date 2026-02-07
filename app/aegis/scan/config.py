@@ -1,3 +1,17 @@
+"""Config for AEGIS scan.
+
+Purpose:
+- Re-export scan-related model, concurrency, timeout, and retry settings from
+  central application config.
+
+Used by:
+- `app.aegis.scan.state_worker` and runner modules to control execution.
+- Tool modules to select grounded model and thinking level.
+
+Assumptions:
+- Environment variables in `app.config` are preloaded at process startup.
+"""
+
 from __future__ import annotations
 
 from app.config import (
@@ -23,4 +37,3 @@ __all__ = [
     "GEMINI_TIMEOUT_S",
     "GEMINI_MAX_RETRIES",
 ]
-

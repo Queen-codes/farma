@@ -1,3 +1,18 @@
+"""Grounded Gemini call helpers for web-evidence extraction.
+
+Purpose:
+- Execute Gemini calls with Google Search grounding enabled.
+- Normalize grounded citations/spans into stable dict payloads consumed by
+  scan tools and persistence layers.
+
+Used by:
+- `app.aegis.scan.tools.*` modules.
+
+Assumptions:
+- Caller passes an authenticated Gemini client.
+- Response structure follows google-genai candidate/grounding schema.
+"""
+
 from __future__ import annotations
 
 import json
@@ -8,7 +23,23 @@ from google.genai import types
 
 
 def safe_json_extract(answer_text: str) -> Optional[dict]:
-    """Best-effort JSON extraction from a text response (optional helper)."""
+    """Parse a JSON object from free-form model text when possible.
+
+    Args:
+        answer_text: Raw model response text.
+
+    Returns:
+        Optional[dict]: Parsed JSON object or `None` if parsing fails.
+
+    Raises:
+        Does not raise intentionally.
+
+    Side Effects:
+        None.
+
+    Latency:
+        Fast in-memory parsing/string scanning.
+    """
     if not answer_text:
         return None
     answer_text = answer_text.strip()
@@ -32,7 +63,7 @@ def safe_json_extract(answer_text: str) -> Optional[dict]:
 
 async def grounded_call_text(
     *,
-    aclient,
+    aclient: Any,
     model: str,
     prompt: str,
     thinking_level: str = "LOW",
@@ -40,7 +71,25 @@ async def grounded_call_text(
 ) -> Any:
     """Grounded Gemini call using Google Search (Gemini API, google-genai SDK).
 
-    Returns the raw response object (caller extracts citations and text).
+    Args:
+        aclient: Authenticated Gemini client wrapper.
+        model: Grounded model identifier.
+        prompt: Prompt text sent to model.
+        thinking_level: Gemini thinking level.
+        timeout_s: Optional timeout in seconds.
+
+    Returns:
+        Any: Raw Gemini response object.
+
+    Raises:
+        asyncio.TimeoutError: If timeout elapses before response.
+        Exception: Can propagate network/SDK/model errors.
+
+    Side Effects:
+        Performs network call to Gemini API with Google Search tool enabled.
+
+    Latency:
+        Network and model-inference bound.
     """
     config = types.GenerateContentConfig(
         tools=[types.Tool(google_search=types.GoogleSearch())],
@@ -62,14 +111,21 @@ async def grounded_call_text(
 def extract_grounding_citations(response: Any) -> Dict[str, Any]:
     """Extract report-grade grounding citations and spans from a grounded response.
 
-    Output shape:
-      {
-        "answer_text": str,
-        "sources": [{"idx": int, "uri": str, "title": str}],
-        "spans": [{"start": int, "end": int, "text": str, "chunk_indices":[int], "uris":[str]}],
-        "data": dict | None,
-        "errors": str | None
-      }
+    Args:
+        response: Raw Gemini grounded response object.
+
+    Returns:
+        Dict[str, Any]: Normalized payload with answer text, source list, span
+        list, optional `data`, and error field.
+
+    Raises:
+        Does not raise intentionally; parse failures are returned in `errors`.
+
+    Side Effects:
+        None.
+
+    Latency:
+        Linear in number of grounding chunks/support spans.
     """
     errors: Optional[str] = None
     answer_text = ""
