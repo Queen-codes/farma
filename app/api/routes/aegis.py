@@ -1,0 +1,1286 @@
+"""AEGIS API endpoints for scans, synthesis, simulations, marathon, and reports.
+
+Key responsibilities:
+- Start and track asynchronous AEGIS pipeline jobs.
+- Expose dashboard/timeline/status endpoints for UI consumption.
+- Provide report download/listing endpoints backed by local storage or GCS.
+- Translate internal job-store and DB data into stable API response schemas.
+
+Used by:
+- `app.main` through router inclusion.
+- Frontend dashboards and operator tools that trigger AEGIS workflows.
+
+Assumptions:
+- API auth dependency protects all routes in this module.
+- AEGIS workflow runners (`scan`, `synthesis`, `simulation`, `report`,
+  `marathon`) are importable and configured.
+- Database connectivity exists for status/timeline endpoints.
+- GCS configuration may be present for report retrieval fallback.
+"""
+
+from __future__ import annotations
+
+import os
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import FileResponse, Response
+
+from app.api.helpers.aegis_queries import priority_from_intel, summaries_for_scan
+from app.api.helpers.paths import REPORTS_DIR
+from app.api.helpers.runtime import spawn_bg_task, utcnow_naive
+from app.api.helpers.security import require_api_auth
+from app.api.schemas import (
+    AegisDashboardResponse,
+    AegisMarathonDayResponse,
+    AegisMarathonRunRequest,
+    AegisMarathonRunResponse,
+    AegisMarathonTimelineResponse,
+    AegisReportRequest,
+    AegisReportResponse,
+    AegisReportStatusResponse,
+    AegisScanRequest,
+    AegisScanResponse,
+    AegisScanStatusResponse,
+    AegisSimulationRequest,
+    AegisSimulationResponse,
+    AegisSimulationStatusResponse,
+    AegisSynthesisRequest,
+    AegisSynthesisResponse,
+    ContinuityChainEntry,
+    JobStatus,
+    ReportStatus,
+    ScanStatus,
+    StateIntelligenceSummary,
+)
+from app.config import AEGIS_FOCUS_STATES
+from app.utils.job_store import job_store
+
+router = APIRouter(
+    prefix="/api/aegis",
+    tags=["AEGIS"],
+    dependencies=[Depends(require_api_auth)],
+)
+
+
+@router.get("/dashboard", response_model=AegisDashboardResponse)
+async def get_aegis_dashboard() -> AegisDashboardResponse:
+    """Return high-level AEGIS dashboard aggregates.
+
+    Request:
+        No body, query, or path parameters.
+
+    Response:
+        `AegisDashboardResponse` containing latest scan summary, scan/report
+        counters, focus states, and state-level priority summaries.
+
+    Status Codes:
+        200: Dashboard payload returned. Internal read failures are degraded to
+            empty/fallback values instead of non-200 errors.
+
+    Auth:
+        Requires valid API token via `require_api_auth`.
+
+    Idempotency:
+        Idempotent read-only endpoint.
+
+    Args:
+        None.
+
+    Returns:
+        AegisDashboardResponse: Snapshot of dashboard metrics.
+
+    Raises:
+        Does not raise intentionally; exceptions are converted into fallback
+        responses.
+
+    Side Effects:
+        Performs database reads and local filesystem glob on `reports/*.pdf`.
+
+    Latency:
+        DB-backed reads can be slow for large scan history tables.
+    """
+    from app.aegis.db.connection import get_async_session
+    from app.aegis.db.models import AegisScan, StateIntelligence
+    from sqlalchemy import select, desc
+
+    try:
+        async with get_async_session() as session:
+            latest_scan_result = await session.execute(
+                select(AegisScan).order_by(desc(AegisScan.started_at)).limit(1)
+            )
+            latest_scan = latest_scan_result.scalar_one_or_none()
+
+            scan_count_result = await session.execute(select(AegisScan))
+            total_scans = len(scan_count_result.scalars().all())
+
+            state_summaries = []
+            if latest_scan:
+                state_intel_result = await session.execute(
+                    select(StateIntelligence).where(
+                        StateIntelligence.scan_id == latest_scan.id
+                    )
+                )
+                for intel in state_intel_result.scalars().all():
+                    level, score = priority_from_intel(intel)
+                    state_summaries.append(
+                        StateIntelligenceSummary(
+                            state_name=intel.state_name,
+                            conflict_events=intel.conflict_events_count,
+                            idp_estimate=intel.idp_estimate,
+                            idp_trend=intel.idp_trend,
+                            food_insecurity_level=intel.food_insecurity_level,
+                            ipc_phase=intel.ipc_phase,
+                            markets_operational=intel.markets_operational,
+                            priority_level=level,
+                            priority_score=score,
+                        )
+                    )
+
+            latest_scan_response = None
+            if latest_scan:
+                latest_scan_response = AegisScanStatusResponse(
+                    scan_id=latest_scan.id,
+                    run_id=latest_scan.run_id,
+                    status=ScanStatus(latest_scan.status),
+                    started_at=latest_scan.started_at,
+                    completed_at=latest_scan.completed_at,
+                    states_scanned=latest_scan.states_scanned,
+                    total_events=latest_scan.total_events,
+                    total_fatalities=latest_scan.total_fatalities,
+                )
+
+            return AegisDashboardResponse(
+                latest_scan=latest_scan_response,
+                total_scans=total_scans,
+                total_reports=len(list(REPORTS_DIR.glob("*.pdf"))),
+                focus_states=AEGIS_FOCUS_STATES,
+                state_summaries=state_summaries,
+                recent_alerts=[],
+            )
+    except Exception:
+        return AegisDashboardResponse(
+            latest_scan=None,
+            total_scans=0,
+            total_reports=len(list(REPORTS_DIR.glob("*.pdf"))),
+            focus_states=AEGIS_FOCUS_STATES,
+            state_summaries=[],
+            recent_alerts=[],
+        )
+
+
+@router.post("/scan", response_model=AegisScanResponse)
+async def trigger_aegis_scan(
+    payload: AegisScanRequest, request: Request
+) -> AegisScanResponse:
+    """Start an asynchronous AEGIS scan job.
+
+    Request:
+        JSON body (`AegisScanRequest`):
+        - `states` (optional list[str]): defaults to configured focus states.
+        - `days_back` (int): lookback window (1-365).
+        - `force_refresh` (bool): bypass recent-data caching when true.
+
+    Response:
+        `AegisScanResponse` with job/run identifiers and immediate `running`
+        status.
+
+    Status Codes:
+        200: Scan accepted and background execution scheduled.
+
+    Auth:
+        Requires valid API token via `require_api_auth`.
+
+    Idempotency:
+        Not idempotent. Each request creates a new scan run/job.
+
+    Args:
+        payload: Scan configuration parameters from request body.
+        request: FastAPI request object used for background task scheduling.
+
+    Returns:
+        AegisScanResponse: Accepted scan run contract for polling.
+
+    Raises:
+        Does not raise intentionally for scan-start failures in this handler;
+        background failures are written to job events/status.
+
+    Side Effects:
+        Writes scan/job records to DB and job store.
+        Spawns background scan workflow (`run_aegis_scan`).
+
+    Latency:
+        Fast request path; heavy scan logic runs asynchronously and may involve
+        geospatial and intelligence data processing.
+    """
+    from app.aegis.graph import run_aegis_scan
+
+    states = payload.states or AEGIS_FOCUS_STATES
+    days_back = getattr(payload, "days_back", 7) or 7
+    run_id = f"SCAN-{uuid.uuid4().hex[:8].upper()}"
+    scan_db_id = 0
+    try:
+        from app.aegis.db.connection import get_async_session
+        from app.aegis.db.models import AegisScan
+
+        async with get_async_session() as session:
+            scan = AegisScan(
+                run_id=run_id,
+                started_at=utcnow_naive(),
+                status="running",
+                states_scanned=0,
+                total_events=0,
+                total_fatalities=0,
+            )
+            session.add(scan)
+            await session.flush()
+            scan_db_id = scan.id
+    except Exception:
+        scan_db_id = 0
+
+    await job_store.create_job(
+        run_id,
+        "aegis_scan",
+        metadata={"states": states, "scan_id": scan_db_id, "days_back": days_back},
+    )
+    await job_store.add_event(
+        run_id,
+        event_type="scan_started",
+        status="running",
+        step="scan_start",
+        message="AEGIS scan started",
+        payload={"states": states},
+    )
+
+    async def run_scan_background() -> None:
+        """Execute scan workflow in background and persist terminal state.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            Does not raise intentionally; errors are captured in job status/events.
+
+        Side Effects:
+            Calls scan DAG and updates `job_store` status/event rows.
+
+        Latency:
+            Potentially high due to scan collection and analysis work.
+        """
+        try:
+            result = await run_aegis_scan(
+                states=states,
+                days_back=days_back,
+                force=payload.force_refresh,
+                run_id=run_id,
+                scan_id=scan_db_id,
+            )
+            if (result.get("status") or "").lower() == "failed":
+                err = result.get("error") or "AEGIS scan failed"
+                await job_store.update_job(
+                    run_id,
+                    status="failed",
+                    result=result,
+                    completed_at=utcnow_naive(),
+                )
+                await job_store.add_event(
+                    run_id,
+                    event_type="scan_failed",
+                    status="failed",
+                    step="scan_error",
+                    message=str(err),
+                    payload={"scan_id": scan_db_id},
+                )
+                return
+            await job_store.update_job(
+                run_id,
+                status="completed",
+                result=result,
+                completed_at=utcnow_naive(),
+            )
+            await job_store.add_event(
+                run_id,
+                event_type="scan_completed",
+                status="completed",
+                step="scan_complete",
+                message="AEGIS scan completed",
+                payload={"scan_id": scan_db_id},
+            )
+        except Exception as e:
+            await job_store.update_job(
+                run_id,
+                status="failed",
+                result={"error": str(e), "scan_id": scan_db_id},
+                completed_at=utcnow_naive(),
+            )
+            await job_store.add_event(
+                run_id,
+                event_type="scan_failed",
+                status="failed",
+                step="scan_error",
+                message=str(e),
+                payload={"scan_id": scan_db_id},
+            )
+
+    # run in background (captures job events inside scan engine)
+    spawn_bg_task(request.app, run_scan_background())
+
+    return AegisScanResponse(
+        scan_id=scan_db_id,
+        run_id=run_id,
+        status="running",
+        states_to_scan=states,
+        message=f"Scan initiated. Poll /api/aegis/scan/{run_id} for status.",
+    )
+
+
+@router.post("/synthesis", response_model=AegisSynthesisResponse)
+async def trigger_aegis_synthesis(
+    payload: AegisSynthesisRequest, request: Request
+) -> AegisSynthesisResponse:
+    """Start asynchronous synthesis for an existing scan.
+
+    Request:
+        JSON body (`AegisSynthesisRequest`):
+        - `scan_id` (int): scan to synthesize.
+        - `states` (optional list[str]): defaults to configured focus states.
+
+    Response:
+        `AegisSynthesisResponse` with synthesis run ID and `running` status.
+
+    Status Codes:
+        200: Synthesis job accepted and queued.
+
+    Auth:
+        Requires valid API token via `require_api_auth`.
+
+    Idempotency:
+        Not idempotent. Each call creates a new synthesis run.
+
+    Args:
+        payload: Synthesis request parameters.
+        request: FastAPI request object used for background task scheduling.
+
+    Returns:
+        AegisSynthesisResponse: Run metadata for job/event polling.
+
+    Raises:
+        Does not raise intentionally during request handling in normal flow.
+
+    Side Effects:
+        Writes job metadata/events and spawns background synthesis DAG execution.
+
+    Latency:
+        Fast request path; synthesis DAG can be slow due to LLM and data fusion
+        steps.
+    """
+    from app.aegis.synthesis.runner import run_synthesis_dag
+
+    scan_id = int(payload.scan_id)
+    states = payload.states or AEGIS_FOCUS_STATES
+    run_id = f"SYNTH-{uuid.uuid4().hex[:8].upper()}"
+
+    await job_store.create_job(
+        run_id,
+        "aegis_synthesis",
+        metadata={"scan_id": scan_id, "states": states},
+    )
+    await job_store.add_event(
+        run_id,
+        "synthesis_started",
+        status="running",
+        step="synthesis_start",
+        message="AEGIS synthesis started",
+        payload={"scan_id": scan_id, "states": states},
+    )
+
+    async def run_synthesis_background() -> None:
+        """Run synthesis DAG and normalize completion/failure job updates.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            Does not raise intentionally; exceptions are persisted as job failure.
+
+        Side Effects:
+            Calls synthesis DAG and writes job status/event updates.
+
+        Latency:
+            Potentially high due to model-driven synthesis steps.
+        """
+        try:
+            result = await run_synthesis_dag(
+                scan_id=scan_id,
+                states=states,
+                run_id=run_id,
+                emit_job_events=True,
+            )
+            await job_store.update_job(
+                run_id,
+                status="completed",
+                result=result,
+                completed_at=utcnow_naive(),
+            )
+            await job_store.add_event(
+                run_id,
+                event_type="synthesis_completed",
+                status="completed",
+                step="synthesis_complete",
+                message="AEGIS synthesis completed",
+                payload={"scan_id": scan_id},
+            )
+        except Exception as e:
+            await job_store.update_job(
+                run_id,
+                status="failed",
+                result={"error": str(e), "scan_id": scan_id},
+                completed_at=utcnow_naive(),
+            )
+            await job_store.add_event(
+                run_id,
+                event_type="synthesis_failed",
+                status="failed",
+                step="synthesis_error",
+                message=str(e),
+                payload={"scan_id": scan_id},
+            )
+
+    spawn_bg_task(request.app, run_synthesis_background())
+    return AegisSynthesisResponse(
+        run_id=run_id,
+        status="running",
+        message=f"Synthesis initiated. Poll /api/jobs/{run_id}/events for status.",
+    )
+
+
+@router.post("/marathon/run", response_model=AegisMarathonRunResponse)
+async def run_marathon_day_endpoint(
+    payload: AegisMarathonRunRequest, request: Request
+) -> AegisMarathonRunResponse:
+    """Start one AEGIS marathon continuity run.
+
+    Request:
+        JSON body (`AegisMarathonRunRequest`):
+        - `track_id` (str): continuity track identifier.
+        - `scan_id` (optional int): required in manual mode.
+        - `day_date` (optional YYYY-MM-DD): defaults to current UTC date.
+        - `prev_scan_id` (optional int): reference scan for delta calculations.
+        - `mode` (`manual` or `autonomous`).
+
+    Response:
+        `AegisMarathonRunResponse` with run metadata and `running` status.
+
+    Status Codes:
+        200: Run accepted and queued.
+        422: Manual mode requested without `scan_id`.
+
+    Auth:
+        Requires valid API token via `require_api_auth`.
+
+    Idempotency:
+        Not idempotent. Each call creates a new marathon run.
+
+    Args:
+        payload: Marathon run configuration.
+        request: FastAPI request object used to schedule background work.
+
+    Returns:
+        AegisMarathonRunResponse: Immediate run contract for tracking.
+
+    Raises:
+        HTTPException: 422 when manual-mode preconditions are not satisfied.
+
+    Side Effects:
+        Writes job metadata and spawns background marathon execution.
+
+    Latency:
+        Fast request path; background marathon execution may include LLM-heavy
+        reasoning and downstream workflow calls.
+    """
+    from app.aegis.marathon.runner import run_marathon_day
+
+    mode = payload.mode or "manual"
+
+    # In manual mode, scan_id is required
+    if mode == "manual" and payload.scan_id is None:
+        raise HTTPException(status_code=422, detail="scan_id is required for manual mode")
+
+    run_id = f"MARA-{uuid.uuid4().hex[:8].upper()}"
+    day_date = payload.day_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    await job_store.create_job(
+        run_id,
+        "aegis_marathon",
+        metadata={
+            "track_id": payload.track_id,
+            "day_date": day_date,
+            "scan_id": int(payload.scan_id) if payload.scan_id else None,
+            "prev_scan_id": int(payload.prev_scan_id) if payload.prev_scan_id else None,
+            "mode": mode,
+        },
+    )
+
+    async def _bg() -> None:
+        """Execute marathon-day background run with configured LLM settings.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            Exceptions from `run_marathon_day` may propagate to task logs.
+
+        Side Effects:
+            Calls marathon runner which writes DB/job artifacts and may trigger
+            downstream simulation/report actions.
+
+        Latency:
+            Potentially high for LLM-heavy continuity analysis.
+        """
+        await run_marathon_day(
+            run_id=run_id,
+            track_id=payload.track_id,
+            day_date=day_date,
+            scan_id=int(payload.scan_id) if payload.scan_id else None,
+            prev_scan_id=int(payload.prev_scan_id) if payload.prev_scan_id else None,
+            mode=mode,
+            config={
+                "model": os.getenv("GEMINI_MODEL_MARATHON", "gemini-3-flash-preview"),
+            },
+            emit_job_events=True,
+        )
+
+    spawn_bg_task(request.app, _bg())
+    return AegisMarathonRunResponse(
+        run_id=run_id,
+        status=JobStatus.RUNNING,
+        track_id=payload.track_id,
+        scan_id=int(payload.scan_id) if payload.scan_id else None,
+        day_date=day_date,
+        mode=mode,
+    )
+
+
+@router.get("/marathon/{track_id}/timeline", response_model=AegisMarathonTimelineResponse)
+async def get_marathon_timeline(track_id: str) -> AegisMarathonTimelineResponse:
+    """Return chronological continuity data for a marathon track.
+
+    Request:
+        Path parameter `track_id` identifies a marathon continuity chain.
+
+    Response:
+        `AegisMarathonTimelineResponse` containing per-day records plus a
+        derived continuity chain summary.
+
+    Status Codes:
+        200: Timeline returned (possibly empty).
+
+    Auth:
+        Requires valid API token via `require_api_auth`.
+
+    Idempotency:
+        Idempotent read endpoint.
+
+    Args:
+        track_id: Continuity track identifier.
+
+    Returns:
+        AegisMarathonTimelineResponse: Ordered timeline and continuity metrics.
+
+    Raises:
+        SQLAlchemyError: Can propagate on DB query failure.
+
+    Side Effects:
+        Performs database reads only.
+
+    Latency:
+        Depends on number of marathon-day rows for the track.
+    """
+    from app.aegis.db.connection import get_async_session
+    from app.aegis.db.models import AegisMarathonDay
+    from sqlalchemy import select
+
+    async with get_async_session() as session:
+        res = await session.execute(
+            select(AegisMarathonDay)
+            .where(AegisMarathonDay.track_id == track_id)
+            .order_by(AegisMarathonDay.day_date)
+        )
+        rows = res.scalars().all()
+
+    def _short(s: Optional[str]) -> Optional[str]:
+        """Shorten thought signatures for compact timeline rendering.
+
+        Args:
+            s: Full thought-signature string or `None`.
+
+        Returns:
+            Optional[str]: Original or abbreviated signature.
+
+        Raises:
+            Does not raise intentionally.
+
+        Side Effects:
+            None.
+
+        Latency:
+            Constant-time string processing.
+        """
+        if not s:
+            return None
+        s = str(s).strip()
+        if len(s) <= 24:
+            return s
+        return f"{s[:12]}…{s[-12:]}"
+
+    days: list[AegisMarathonDayResponse] = []
+    chain: list[ContinuityChainEntry] = []
+    total_corrections = 0
+    total_actions = 0
+    prev_sig: Optional[str] = None
+
+    for r in rows:
+        note = r.continuity_note_json or {}
+        corrections = note.get("self_corrections") or []
+        actions = r.actions_taken or []
+        predictions = note.get("predictions") or []
+
+        total_corrections += len(corrections)
+        total_actions += len(actions)
+
+        # Check if thought signature chain is intact
+        sig_linked = False
+        if prev_sig and r.prev_thought_signature:
+            sig_linked = r.prev_thought_signature == prev_sig
+        prev_sig = r.thought_signature
+
+        days.append(AegisMarathonDayResponse(
+            id=r.id,
+            track_id=r.track_id,
+            day_date=str(r.day_date),
+            scan_id=r.scan_id,
+            prev_scan_id=r.prev_scan_id,
+            delta_json=r.delta_json,
+            continuity_note_json=r.continuity_note_json,
+            thought_signature=r.thought_signature,
+            prev_thought_signature=r.prev_thought_signature,
+            signature_short=_short(r.thought_signature),
+            prev_signature_short=_short(r.prev_thought_signature),
+            thinking_level=r.thinking_level,
+            actions_taken=actions if actions else None,
+            simulation_triggered=r.simulation_triggered,
+            report_triggered=r.report_triggered,
+            created_at=r.created_at.isoformat() if r.created_at else None,
+        ))
+
+        chain.append(ContinuityChainEntry(
+            day_date=str(r.day_date),
+            thinking_level=r.thinking_level,
+            summary=note.get("summary", ""),
+            decision_explanation=note.get("decision_explanation", ""),
+            predictions=predictions,
+            self_corrections=corrections,
+            actions_taken=actions,
+            signature_linked=sig_linked,
+        ))
+
+    return AegisMarathonTimelineResponse(
+        track_id=track_id,
+        days=days,
+        continuity_chain=chain,
+        total_days=len(days),
+        total_self_corrections=total_corrections,
+        total_actions=total_actions,
+    )
+
+
+@router.post("/simulations", response_model=AegisSimulationResponse)
+async def create_simulation(
+    payload: AegisSimulationRequest, request: Request
+) -> AegisSimulationResponse:
+    """Start a crisis simulation run for a selected scan and scenario.
+
+    Request:
+        JSON body (`AegisSimulationRequest`):
+        - `scan_id` (int): base scan for simulation.
+        - `scenario` (object): scenario knobs consumed by simulator DAG.
+
+    Response:
+        `AegisSimulationResponse` with simulation ID and initial status.
+
+    Status Codes:
+        200: Simulation accepted and queued.
+
+    Auth:
+        Requires valid API token via `require_api_auth`.
+
+    Idempotency:
+        Not idempotent. Each request creates a new simulation ID/job.
+
+    Args:
+        payload: Simulation input payload.
+        request: FastAPI request object for background task scheduling.
+
+    Returns:
+        AegisSimulationResponse: Job metadata for polling progress.
+
+    Raises:
+        Does not raise intentionally in normal request handling.
+
+    Side Effects:
+        Writes job metadata and starts background simulation DAG execution.
+
+    Latency:
+        Fast request path; simulation DAG can be slow due to model inference.
+    """
+    from app.aegis.simulator.runner import run_simulation_dag
+
+    scan_id = int(payload.scan_id)
+    simulation_id = f"SIM-{uuid.uuid4().hex[:8].upper()}"
+
+    await job_store.create_job(
+        simulation_id,
+        "aegis_simulation",
+        metadata={"scan_id": scan_id, "scenario": payload.scenario},
+    )
+
+    async def _bg() -> None:
+        """Run simulation DAG using environment-driven model configuration.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            Exceptions from `run_simulation_dag` may propagate to task logs.
+
+        Side Effects:
+            Executes simulation workflow and emits job events.
+
+        Latency:
+            Potentially high due to projection + narrative generation work.
+        """
+        cfg = {
+            "model": os.getenv("GEMINI_MODEL_SIMULATOR", "gemini-3-flash-preview"),
+            "thinking_level": os.getenv("SIMULATOR_THINKING_LEVEL", "LOW"),
+        }
+        await run_simulation_dag(
+            scan_id=scan_id,
+            simulation_id=simulation_id,
+            scenario=payload.scenario,
+            run_id=simulation_id,
+            emit_job_events=True,
+            config=cfg,
+        )
+
+    spawn_bg_task(request.app, _bg())
+    return AegisSimulationResponse(
+        simulation_id=simulation_id,
+        status="running",
+        message=f"Simulation started. Poll /api/jobs/{simulation_id}/events for progress.",
+    )
+
+
+@router.get("/simulations/{simulation_id}", response_model=AegisSimulationStatusResponse)
+async def get_simulation(simulation_id: str) -> AegisSimulationStatusResponse:
+    """Return persisted status/details for a simulation run.
+
+    Request:
+        Path parameter `simulation_id` is required.
+
+    Response:
+        `AegisSimulationStatusResponse` loaded from simulation persistence.
+
+    Status Codes:
+        200: Simulation found.
+        404: Simulation ID is unknown.
+
+    Auth:
+        Requires valid API token via `require_api_auth`.
+
+    Idempotency:
+        Idempotent read endpoint.
+
+    Args:
+        simulation_id: Simulation identifier returned by `/simulations`.
+
+    Returns:
+        AegisSimulationStatusResponse: Current simulation record.
+
+    Raises:
+        HTTPException: 404 when no simulation record is found.
+
+    Side Effects:
+        Reads simulation status from persistence layer.
+
+    Latency:
+        Depends on storage backend latency.
+    """
+    from app.aegis.simulator.persist import get_simulation
+
+    sim = await get_simulation(simulation_id)
+    if not sim:
+        raise HTTPException(status_code=404, detail="Simulation not found")
+    return AegisSimulationStatusResponse(**sim)
+
+
+@router.get("/scan/{scan_id}", response_model=AegisScanStatusResponse)
+async def get_scan_status(scan_id: str) -> AegisScanStatusResponse:
+    """Return scan progress/details by run ID or numeric scan ID.
+
+    Request:
+        Path parameter `scan_id` accepts either:
+        - A run/job ID string (for example `SCAN-XXXX`), or
+        - A numeric database scan ID.
+
+    Response:
+        `AegisScanStatusResponse` containing status, totals, and optional
+        state/event/LGA summaries.
+
+    Status Codes:
+        200: Matching job or scan found.
+        404: No matching job/scan exists.
+
+    Auth:
+        Requires valid API token via `require_api_auth`.
+
+    Idempotency:
+        Idempotent read endpoint.
+
+    Args:
+        scan_id: Run ID or numeric scan identifier.
+
+    Returns:
+        AegisScanStatusResponse: Current scan/job status snapshot.
+
+    Raises:
+        HTTPException: 404 when the scan cannot be resolved.
+
+    Side Effects:
+        Reads job-store records and database scan/intelligence records.
+
+    Latency:
+        Can be moderate for large scans because summary enrichment performs
+        additional DB queries.
+    """
+    job = await job_store.get_job(scan_id)
+    if job:
+        status = job.get("status", "running")
+        metadata = job.get("metadata") or {}
+        result = job.get("result") or {}
+        scan_id_value = metadata.get("scan_id") or result.get("scan_id") or 0
+        summaries = None
+        conflict_events = None
+        lga_risk = None
+        if scan_id_value:
+            try:
+                summaries, conflict_events, lga_risk = await summaries_for_scan(
+                    int(scan_id_value)
+                )
+            except Exception:
+                summaries, conflict_events, lga_risk = None, None, None
+        return AegisScanStatusResponse(
+            scan_id=int(scan_id_value or 0),
+            run_id=scan_id,
+            status=ScanStatus(
+                status if status in ("running", "completed", "failed") else "running"
+            ),
+            started_at=job.get("started_at", datetime.now(timezone.utc)),
+            completed_at=job.get("completed_at"),
+            states_scanned=result.get("states_scanned", 0),
+            total_events=result.get("total_events", 0),
+            total_fatalities=result.get("total_fatalities", 0),
+            state_summaries=summaries,
+            conflict_events=conflict_events,
+            lga_risk=lga_risk,
+        )
+
+    try:
+        from app.aegis.db.connection import get_async_session
+        from app.aegis.db.models import AegisScan
+        from sqlalchemy import select
+
+        async with get_async_session() as session:
+            result = await session.execute(select(AegisScan).where(AegisScan.run_id == scan_id))
+            scan = result.scalar_one_or_none()
+            if not scan and scan_id.isdigit():
+                result = await session.execute(select(AegisScan).where(AegisScan.id == int(scan_id)))
+                scan = result.scalar_one_or_none()
+            if not scan:
+                raise HTTPException(status_code=404, detail=f"Scan {scan_id} not found")
+            summaries, conflict_events, lga_risk = await summaries_for_scan(scan.id)
+            return AegisScanStatusResponse(
+                scan_id=scan.id,
+                run_id=scan.run_id,
+                status=ScanStatus(scan.status),
+                started_at=scan.started_at,
+                completed_at=scan.completed_at,
+                states_scanned=scan.states_scanned,
+                total_events=scan.total_events,
+                total_fatalities=scan.total_fatalities,
+                state_summaries=summaries,
+                conflict_events=conflict_events,
+                lga_risk=lga_risk,
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=404, detail=f"Scan {scan_id} not found")
+
+
+@router.post("/report", response_model=AegisReportResponse)
+async def generate_aegis_report(
+    payload: AegisReportRequest, request: Request
+) -> AegisReportResponse:
+    """Start asynchronous PDF report generation for a scan.
+
+    Request:
+        JSON body (`AegisReportRequest`):
+        - `scan_id` (int): source scan ID.
+        - `states` (optional list[str]): subset of states to include.
+        - `include_infographics` (bool): generate infographic assets.
+        - `include_annexes` (bool): include state annexes.
+        - `simulation_id` (optional str): attach simulation context.
+
+    Response:
+        `AegisReportResponse` with report ID and initial `running` status.
+
+    Status Codes:
+        200: Report job accepted and background execution scheduled.
+
+    Auth:
+        Requires valid API token via `require_api_auth`.
+
+    Idempotency:
+        Not idempotent. Each call creates a new report job.
+
+    Args:
+        payload: Report-generation options and scan reference.
+        request: FastAPI request object for background task scheduling.
+
+    Returns:
+        AegisReportResponse: Immediate report job metadata.
+
+    Raises:
+        Does not raise intentionally in normal request path.
+
+    Side Effects:
+        Writes job/event records and triggers background report DAG execution.
+
+    Latency:
+        Fast request path; report generation is I/O and model heavy.
+    """
+    from app.aegis.report.runner import run_report_dag
+
+    scan_id = int(payload.scan_id)
+    report_id = f"RPT-{uuid.uuid4().hex[:8].upper()}"
+    await job_store.create_job(
+        report_id,
+        "aegis_report",
+        metadata={"scan_id": scan_id, "states": payload.states or []},
+    )
+    await job_store.add_event(
+        report_id,
+        "report_started",
+        status="running",
+        step="report_start",
+        message="AEGIS report started",
+        payload={"scan_id": scan_id},
+    )
+
+    async def _bg() -> None:
+        """Run report DAG and persist completion/failure into job contracts.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            Does not raise intentionally; failures are persisted in `job_store`.
+
+        Side Effects:
+            Executes report generation and writes job status/event updates.
+
+        Latency:
+            Potentially high for PDF generation, storage, and optional imagery.
+        """
+        try:
+            result = await run_report_dag(
+                report_id=report_id,
+                scan_id=scan_id,
+                states=payload.states or [],
+                include_infographics=payload.include_infographics,
+                include_annexes=payload.include_annexes,
+                output_dir=str(REPORTS_DIR),
+                simulation_id=payload.simulation_id,
+                emit_job_events=True,
+            )
+            await job_store.update_job(
+                report_id,
+                status="completed",
+                result=result,
+                completed_at=utcnow_naive(),
+            )
+            await job_store.add_event(
+                report_id,
+                "report_completed",
+                status="completed",
+                step="report_complete",
+                message="AEGIS report completed",
+                payload={"pdf_path": result.get("pdf_path")},
+            )
+        except Exception as e:
+            await job_store.update_job(
+                report_id,
+                status="failed",
+                result={"error": str(e)},
+                completed_at=utcnow_naive(),
+            )
+            await job_store.add_event(
+                report_id,
+                "report_failed",
+                status="failed",
+                step="report_error",
+                message=str(e),
+            )
+
+    spawn_bg_task(request.app, _bg())
+    return AegisReportResponse(
+        report_id=report_id,
+        status="running",
+        message="Report generation started.",
+        pdf_path=None,
+        download_url=None,
+    )
+
+
+@router.get("/report/{report_id}", response_model=AegisReportStatusResponse)
+async def get_report_status(report_id: str) -> AegisReportStatusResponse:
+    """Return detailed status for a report-generation job.
+
+    Request:
+        Path parameter `report_id` is required.
+
+    Response:
+        `AegisReportStatusResponse` including status, output path/url,
+        completed steps, timings, and summary metrics.
+
+    Status Codes:
+        200: Report job found.
+        404: Report job not found.
+
+    Auth:
+        Requires valid API token via `require_api_auth`.
+
+    Idempotency:
+        Idempotent read endpoint.
+
+    Args:
+        report_id: Report job identifier returned by `/report`.
+
+    Returns:
+        AegisReportStatusResponse: Current report job status view.
+
+    Raises:
+        HTTPException: 404 when the report job does not exist.
+
+    Side Effects:
+        Reads report job data from job store.
+
+    Latency:
+        Depends on job-store backend latency.
+    """
+    job = await job_store.get_job(report_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Report {report_id} not found")
+    status_value = (job.get("status") or "running").lower()
+    if status_value == "error":
+        status_value = "failed"
+    if status_value not in {"running", "completed", "failed"}:
+        status_value = "running"
+    return AegisReportStatusResponse(
+        report_id=report_id,
+        status=ReportStatus(status_value),
+        started_at=job.get("started_at"),
+        completed_at=job.get("completed_at"),
+        pdf_path=(job.get("result") or {}).get("pdf_path"),
+        download_url=f"/api/aegis/report/{report_id}/download"
+        if (job.get("result") or {}).get("pdf_path")
+        else None,
+        steps_completed=job.get("steps_completed") or [],
+        timings=job.get("timings") or {},
+        error=(job.get("result") or {}).get("error"),
+        states_analyzed=(job.get("result") or {}).get("states") or [],
+        sources_cited=(job.get("result") or {}).get("sources_cited") or 0,
+        infographics_generated=(job.get("result") or {}).get("infographics_generated")
+        or 0,
+    )
+
+
+@router.get("/report/{report_id}/download")
+async def download_report(report_id: str) -> Response:
+    """Download a completed report PDF from local disk or GCS fallback.
+
+    Request:
+        Path parameter `report_id` is required.
+
+    Response:
+        Binary PDF response with `application/pdf` content type.
+
+    Status Codes:
+        200: PDF returned successfully.
+        400: Report exists but is not yet completed.
+        404: Report missing or PDF artifact unavailable.
+
+    Auth:
+        Requires valid API token via `require_api_auth`.
+
+    Idempotency:
+        Idempotent retrieval for an immutable completed report artifact.
+
+    Args:
+        report_id: Report job identifier to download.
+
+    Returns:
+        Response: File response from disk or bytes response from GCS.
+
+    Raises:
+        HTTPException: 400 or 404 based on report state/artifact availability.
+
+    Side Effects:
+        Reads job-store metadata.
+        Performs filesystem checks and optional network call to GCS.
+
+    Latency:
+        May be slow for remote GCS download or large PDFs.
+    """
+    job = await job_store.get_job(report_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Report not found")
+    if (job.get("status") or "running") != "completed":
+        raise HTTPException(status_code=400, detail="Report not yet completed")
+
+    pdf_path = (job.get("result") or {}).get("pdf_path")
+    if not pdf_path or not Path(pdf_path).exists():
+        try:
+            from app.utils.gcs_store import download_bytes
+            from app.config import GCS_BUCKET, GCS_REPORT_PREFIX
+
+            gcs_key = (job.get("result") or {}).get("gcs_key")
+            if not gcs_key and pdf_path:
+                gcs_key = GCS_REPORT_PREFIX + Path(pdf_path).name
+            if gcs_key:
+                data = download_bytes(GCS_BUCKET, gcs_key)
+                filename = Path(gcs_key).name
+                return Response(
+                    content=data,
+                    media_type="application/pdf",
+                    headers={
+                        "Content-Disposition": f'attachment; filename=\"{filename}\"'
+                    },
+                )
+        except Exception:
+            pass
+        raise HTTPException(status_code=404, detail="PDF file not found")
+
+    return FileResponse(
+        path=pdf_path,
+        media_type="application/pdf",
+        filename=Path(pdf_path).name,
+    )
+
+
+@router.get("/reports")
+async def list_reports() -> dict[str, Any]:
+    """List available report artifacts from GCS or local fallback storage.
+
+    Request:
+        No body, query, or path parameters.
+
+    Response:
+        JSON object:
+        - `reports`: list of file metadata dictionaries.
+        - `total`: integer report count.
+
+    Status Codes:
+        200: Listing returned (can be empty).
+
+    Auth:
+        Requires valid API token via `require_api_auth`.
+
+    Idempotency:
+        Idempotent read endpoint.
+
+    Args:
+        None.
+
+    Returns:
+        dict[str, Any]: Report listing payload consumed by frontend report views.
+
+    Raises:
+        Does not raise intentionally; GCS failures fall back to local listing.
+
+    Side Effects:
+        Performs optional network call to GCS and/or local filesystem reads.
+
+    Latency:
+        GCS listing can be slower than local fallback.
+    """
+    reports: list[dict[str, Any]] = []
+    try:
+        from app.utils.gcs_store import list_objects
+        from app.config import GCS_BUCKET, GCS_REPORT_PREFIX
+
+        objs = list_objects(GCS_BUCKET, GCS_REPORT_PREFIX)
+        for obj in objs:
+            name = obj.get("name") or ""
+            if not name.endswith(".pdf"):
+                continue
+            filename = Path(name).name
+            report_id = filename.rsplit("_", 1)[-1].replace(".pdf", "")
+            updated = obj.get("updated")
+            if hasattr(updated, "isoformat"):
+                created_at = updated.isoformat()
+            else:
+                created_at = (
+                    datetime.fromtimestamp(float(updated)).isoformat()
+                    if updated
+                    else datetime.now(timezone.utc).isoformat()
+                )
+            reports.append(
+                {
+                    "filename": filename,
+                    "created_at": created_at,
+                    "size_bytes": int(obj.get("size") or 0),
+                    "download_url": f"/api/aegis/report/{report_id}/download",
+                }
+            )
+    except Exception:
+        for pdf_file in REPORTS_DIR.glob("*.pdf"):
+            reports.append(
+                {
+                    "filename": pdf_file.name,
+                    "created_at": datetime.fromtimestamp(pdf_file.stat().st_mtime).isoformat(),
+                    "size_bytes": pdf_file.stat().st_size,
+                    "download_url": f"/static/reports/{pdf_file.name}",
+                }
+            )
+
+    reports.sort(key=lambda x: x["created_at"], reverse=True)
+    return {"reports": reports, "total": len(reports)}
