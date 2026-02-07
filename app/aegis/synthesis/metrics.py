@@ -1,13 +1,39 @@
+"""Deterministic metric helpers used before synthesis LLM calls.
+
+Purpose:
+- Compute stable priority scoring from normalized scan signals.
+- Derive route-risk hints from conflict event lists.
+
+Used by:
+- `app.aegis.synthesis.state_worker`.
+
+Assumptions:
+- Inputs are partially normalized dictionaries from `normalize_state_intel`.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, List
 
 
 def calculate_food_security_score_from_signals(signals: dict) -> dict:
-    """Deterministic score for prioritization
+    """Compute deterministic priority score/level from core state signals.
 
-    This is made to be intentionally simple and stable for a demo/prototype. It can be and will be replaced with a
-    more sophisticated model later.
+    Args:
+        signals: Dict containing fields like `ipc_phase`, `idp_estimate`,
+            and `conflict_events_count`.
+
+    Returns:
+        dict: Priority payload with `priority_score` and `priority_level`.
+
+    Raises:
+        Does not raise intentionally; malformed values default to zero coercions.
+
+    Side Effects:
+        None.
+
+    Latency:
+        Constant-time arithmetic.
     """
     ipc = int(signals.get("ipc_phase") or 0)
     idp = int(signals.get("idp_estimate") or 0)
@@ -46,7 +72,23 @@ def calculate_food_security_score_from_signals(signals: dict) -> dict:
 
 
 def analyze_safe_routes_from_events(events: List[dict]) -> dict:
-    """Deterministic safe-route heuristics from conflict events list."""
+    """Derive hotspot and route recommendation hints from conflict events.
+
+    Args:
+        events: Conflict event dictionaries containing LGA and fatalities fields.
+
+    Returns:
+        dict: Route metadata with hotspot list and recommendation text.
+
+    Raises:
+        Does not raise intentionally.
+
+    Side Effects:
+        None.
+
+    Latency:
+        Linear in number of events.
+    """
     hotspots = []
     for e in events:
         lga = (e.get("lga") or "").strip()

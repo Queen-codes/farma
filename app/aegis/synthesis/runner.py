@@ -1,3 +1,15 @@
+"""Runner wrapper for executing synthesis and returning summary output.
+
+Purpose:
+- Invoke compiled synthesis graph with concurrency settings.
+- Forward custom graph events into job-store timelines.
+- Return compact summary for API/job callers.
+
+Used by:
+- API route `/api/aegis/synthesis`.
+- Scheduler auto-report pipeline.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
@@ -13,6 +25,26 @@ async def run_synthesis_dag(
     run_id: str,
     emit_job_events: bool = True,
 ) -> Dict[str, Any]:
+    """Execute synthesis for a scan and selected states.
+
+    Args:
+        scan_id: Scan ID whose persisted state intelligence will be synthesized.
+        states: States to process.
+        run_id: Job/run identifier for event forwarding.
+        emit_job_events: Whether to mirror custom graph events to job store.
+
+    Returns:
+        Dict[str, Any]: Summary with status, assessment count, errors, and rollup.
+
+    Raises:
+        Exception: Can propagate graph execution failures.
+
+    Side Effects:
+        Performs model calls, DB writes (via worker nodes), and optional job events.
+
+    Latency:
+        Potentially high due to per-state LLM synthesis + rollup generation.
+    """
     job_store = None
     if emit_job_events:
         try:
@@ -34,6 +66,7 @@ async def run_synthesis_dag(
     final_state: Optional[dict] = None
 
     async def _maybe_emit(custom: dict) -> None:
+        """Forward one custom synthesis event into the async job store."""
         if not job_store:
             return
         try:

@@ -1,3 +1,14 @@
+"""Synthesis graph nodes for per-state assessments and rollup creation.
+
+Purpose:
+- Normalize state inputs and compute deterministic helper metrics.
+- Call Gemini to generate schema-validated assessments and rollups.
+- Persist outputs and emit structured custom events for progress tracking.
+
+Used by:
+- `app.aegis.synthesis.graph`.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -28,6 +39,7 @@ _LLM_SEM: asyncio.Semaphore | None = None
 
 
 def _llm_sem() -> asyncio.Semaphore:
+    """Lazily initialize global semaphore limiting concurrent LLM calls."""
     global _LLM_SEM
     if _LLM_SEM is None:
         _LLM_SEM = asyncio.Semaphore(max(1, int(LLM_CONCURRENCY)))
@@ -35,11 +47,31 @@ def _llm_sem() -> asyncio.Semaphore:
 
 
 async def synth_state_worker(inputs: Dict[str, Any]) -> Dict[str, Any]:
+    """Run synthesis workflow for one state.
+
+    Args:
+        inputs: Worker input with `scan_id`, `state_name`, and optional config.
+
+    Returns:
+        Dict[str, Any]: Graph delta containing either one assessment or one error.
+
+    Raises:
+        Does not raise intentionally; failures are returned in `errors`.
+
+    Side Effects:
+        Reads DB rows, performs LLM call, persists assessment JSON, emits events.
+
+    Latency:
+        DB and LLM inference bound.
+    """
     writer = get_stream_writer()
     scan_id = int(inputs["scan_id"])
     state_name = inputs["state_name"]
 
-    def emit(event: str, payload: dict | None = None, status: str = "running"):
+    def emit(
+        event: str, payload: dict | None = None, status: str = "running"
+    ) -> None:
+        """Emit state-scoped custom event to LangGraph stream writer."""
         if writer:
             writer(
                 {
@@ -133,11 +165,15 @@ async def synth_state_worker(inputs: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def rollup_worker(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Generate and persist scan-level rollup from synthesized assessments."""
     writer = get_stream_writer()
     scan_id = int(state["scan_id"])
     assessments = state.get("assessments") or []
 
-    def emit(event: str, payload: dict | None = None, status: str = "running"):
+    def emit(
+        event: str, payload: dict | None = None, status: str = "running"
+    ) -> None:
+        """Emit rollup-stage custom event to LangGraph stream writer."""
         if writer:
             writer({"event": event, "status": status, "payload": payload or {}})
 
@@ -172,6 +208,7 @@ async def rollup_worker(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 async def finalize_synthesis(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Emit synthesis completion event and return empty graph delta."""
     writer = get_stream_writer()
     if writer:
         writer(

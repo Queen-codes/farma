@@ -1,3 +1,16 @@
+"""Normalization layer bridging scan raw payloads to synthesis-ready inputs.
+
+Purpose:
+- Resolve schema drift between historical and current scan payload shapes.
+- Collect deduped allowed URIs and normalized signals/events per state.
+
+Used by:
+- `app.aegis.synthesis.state_worker`.
+
+Assumptions:
+- `StateIntelligence` rows exist for requested `(scan_id, state_name)` pairs.
+"""
+
 from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
@@ -9,6 +22,7 @@ from app.aegis.db.models import StateIntelligence
 
 
 def _dedupe_sources(tool_payload: dict) -> List[dict]:
+    """Return deduplicated `{uri,title}` source entries from one tool payload."""
     sources = tool_payload.get("sources") or []
     seen = set()
     out = []
@@ -24,6 +38,7 @@ def _dedupe_sources(tool_payload: dict) -> List[dict]:
 
 
 def _collect_allowed_uris(tool_payloads: List[dict]) -> List[str]:
+    """Collect ordered unique URI whitelist across all tool payloads."""
     allowed: List[str] = []
     seen = set()
     for p in tool_payloads:
@@ -36,6 +51,7 @@ def _collect_allowed_uris(tool_payloads: List[dict]) -> List[str]:
 
 
 def _conflict_events_from_raw(conflict_raw: dict) -> List[dict]:
+    """Extract conflict event list from new or legacy conflict payload formats."""
     # new : conflict_raw["data"]["events"]
     data = conflict_raw.get("data") or {}
     events = data.get("events")
@@ -51,7 +67,21 @@ def _conflict_events_from_raw(conflict_raw: dict) -> List[dict]:
 async def normalize_state_intel(*, scan_id: int, state_name: str) -> Dict[str, Any]:
     """Fetch scan outputs for one state and normalize into a compact payload.
 
-    Fixes schema drift between legacy scan and new scan outputs.
+    Args:
+        scan_id: Scan ID to query.
+        state_name: State to normalize.
+
+    Returns:
+        Dict[str, Any]: Normalized synthesis input payload for one state.
+
+    Raises:
+        SQLAlchemyError: Can propagate on DB read failures.
+
+    Side Effects:
+        Reads `StateIntelligence` from database.
+
+    Latency:
+        DB query latency plus in-memory normalization.
     """
     async with async_session() as session:
         res = await session.execute(

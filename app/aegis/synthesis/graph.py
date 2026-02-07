@@ -1,3 +1,14 @@
+"""LangGraph workflow/topology for synthesis state workers and rollup finalization.
+
+Purpose:
+- Fan out state-level synthesis workers.
+- Run rollup aggregation after state assessments.
+- Emit final completion node.
+
+Used by:
+- `app.aegis.synthesis.runner`.
+"""
+
 from __future__ import annotations
 
 import operator
@@ -11,6 +22,8 @@ from .state_worker import finalize_synthesis, rollup_worker, synth_state_worker
 
 
 class SynthesisRunState(TypedDict):
+    """Shared state payload for synthesis graph execution."""
+
     scan_id: int
     states: List[str]
     config: Dict[str, Any]
@@ -20,6 +33,7 @@ class SynthesisRunState(TypedDict):
 
 
 def route_states(state: SynthesisRunState) -> List[Send] | str:
+    """Route START into one `synth_state_worker` send per target state."""
     scan_id = int(state["scan_id"])
     states = state.get("states") or []
     if not states:
@@ -33,7 +47,8 @@ def route_states(state: SynthesisRunState) -> List[Send] | str:
     ]
 
 
-def build_synthesis_graph():
+def build_synthesis_graph() -> Any:
+    """Build and compile the synthesis graph."""
     g: StateGraph = StateGraph(SynthesisRunState)
     g.add_node("synth_state_worker", synth_state_worker)
     g.add_node("rollup_worker", rollup_worker)
@@ -47,4 +62,3 @@ def build_synthesis_graph():
 
 
 synthesis_graph = build_synthesis_graph()
-

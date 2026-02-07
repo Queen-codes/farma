@@ -1,3 +1,16 @@
+"""Environment-driven configuration for synthesis execution.
+
+Purpose:
+- Define model IDs, thinking level, concurrency, and retry/timeout settings
+  for state and rollup synthesis workers.
+
+Used by:
+- `app.aegis.synthesis.state_worker` and `app.aegis.synthesis.runner`.
+
+Assumptions:
+- Environment variables are set before module import.
+"""
+
 from __future__ import annotations
 
 import os
