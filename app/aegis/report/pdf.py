@@ -349,10 +349,13 @@ def build_pdf(
     story.append(PageBreak())
 
     # Section helper
-    def section(title: str, body: str, level: str = "h1") -> None:
+    def section(title: str, body: str | list, level: str = "h1") -> None:
         """Append one narrative section block to story flowables."""
         story.append(Paragraph(title, styles[level]))
         story.append(_hr())
+        # LLM sometimes returns a list instead of a string; normalize.
+        if isinstance(body, list):
+            body = "\n\n".join(str(item) for item in body)
         for para in (body or "").split("\n\n"):
             cleaned = para.strip()
             if not cleaned:
@@ -416,6 +419,8 @@ def build_pdf(
         story.append(_hr())
         for state_name, text in narrative.state_annexes.items():
             story.append(Paragraph(state_name, styles["annex_title"]))
+            if isinstance(text, list):
+                text = "\n\n".join(str(item) for item in text)
             for para in (text or "").split("\n\n"):
                 cleaned = para.strip()
                 if not cleaned:
