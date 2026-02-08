@@ -1,0 +1,7 @@
+{
+  "name": "FARMA - Humanitarian & Agricultural Intelligence",
+  "description": "An AI-powered system for monitoring food insecurity, conflict risk, and agricultural resilience in Nigeria. Features the AEGIS Intelligence Pipeline and Farmer SMS Simulation.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
