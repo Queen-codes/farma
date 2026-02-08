@@ -19,7 +19,7 @@ import asyncio
 import json
 import sys
 import os
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -557,17 +557,13 @@ async def seed() -> None:
                 intel = StateIntelligence(
                     scan_id=scan_id,
                     state_name=state_name,
-                    collected_at=datetime.strptime(date_str, "%Y-%m-%d").replace(
-                        tzinfo=timezone.utc
-                    ),
+                    collected_at=datetime.strptime(date_str, "%Y-%m-%d"),
                     conflict_raw=_make_conflict_raw(events, state_name),
                     displacement_raw=_make_displacement_raw(idp, idp_trend, state_name),
                     food_security_raw=_make_food_raw(ipc, food_level, state_name),
                     economic_raw=_make_econ_raw(markets, state_name),
                     assessment_json=assessment,
-                    synthesized_at=datetime.strptime(date_str, "%Y-%m-%d").replace(
-                        tzinfo=timezone.utc
-                    ),
+                    synthesized_at=datetime.strptime(date_str, "%Y-%m-%d"),
                     synthesis_version="v2-demo",
                     conflict_events_count=n_events,
                     idp_estimate=idp,
