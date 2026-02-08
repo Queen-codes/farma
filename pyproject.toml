@@ -7,6 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "earthengine-api>=1.7.10",
     "fastapi[standard-no-fastapi-cloud-cli]>=0.128.0",
+    "gunicorn>=23.0.0",
     "google-auth>=2.47.0",
     "google-cloud-storage>=3.0.0",
     "google-genai>=1.0.0",
