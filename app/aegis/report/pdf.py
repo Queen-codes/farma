@@ -13,8 +13,8 @@ Assumptions:
 
 from __future__ import annotations
 
-import json
 import logging
+from html import escape
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -258,12 +258,15 @@ def _normalize_section_text(value: object) -> str:
     if isinstance(value, str):
         return value
     if isinstance(value, list):
-        return "\n\n".join(str(item) for item in value)
+        return "\n\n".join(_normalize_section_text(item) for item in value)
     if isinstance(value, dict):
-        try:
-            return json.dumps(value, ensure_ascii=False, indent=2)
-        except Exception:
-            return str(value)
+        lines: List[str] = []
+        for k, v in value.items():
+            key = str(k).replace("_", " ").strip().title()
+            rendered = _normalize_section_text(v).strip()
+            if rendered:
+                lines.append(f"{key}: {rendered}")
+        return "\n".join(lines)
     return str(value)
 
 
@@ -457,7 +460,13 @@ def build_pdf(
     story.append(_hr())
     if narrative.references:
         for i, uri in enumerate(narrative.references, 1):
-            story.append(Paragraph(f"[{i}] {uri}", styles["ref"]))
+            safe_uri = escape(str(uri))
+            story.append(
+                Paragraph(
+                    f'[{i}] <link href="{safe_uri}">{safe_uri}</link>',
+                    styles["ref"],
+                )
+            )
     else:
         story.append(Paragraph("No references available.", styles["body"]))
 

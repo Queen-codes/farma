@@ -43,6 +43,41 @@ class NarrativeSections:
     state_annexes: Dict[str, str] = field(default_factory=dict)
 
 
+def _coerce_text(value: Any) -> str:
+    """Convert possibly structured LLM values into readable paragraph text."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        parts = [_coerce_text(v) for v in value]
+        return "\n\n".join(p for p in parts if p)
+    if isinstance(value, dict):
+        lines: List[str] = []
+        for k, v in value.items():
+            key = str(k).replace("_", " ").strip().title()
+            rendered = _coerce_text(v)
+            if rendered:
+                lines.append(f"{key}: {rendered}")
+        return "\n".join(lines)
+    return str(value).strip()
+
+
+def _coerce_annexes(value: Any) -> Dict[str, str]:
+    """Normalize state annex payload into a string map."""
+    if not isinstance(value, dict):
+        return {}
+    normalized: Dict[str, str] = {}
+    for k, v in value.items():
+        key = str(k).strip()
+        if not key:
+            continue
+        text = _coerce_text(v)
+        if text:
+            normalized[key] = text
+    return normalized
+
+
 def _build_numbered_references(report_data: ReportData) -> tuple[List[str], Dict[str, int]]:
     """Build a numbered reference list and URI-to-number mapping."""
     uris = report_data.uri_whitelist or []
@@ -218,17 +253,17 @@ async def generate_narrative_llm(
     obj = json.loads(text)
 
     return NarrativeSections(
-        executive_summary=obj.get("executive_summary", ""),
-        situation_analysis=obj.get("situation_analysis", ""),
-        food_security_assessment=obj.get("food_security_assessment", ""),
-        displacement_analysis=obj.get("displacement_analysis", ""),
-        risk_assessment=obj.get("risk_assessment", ""),
-        safe_routes_analysis=obj.get("safe_routes_analysis", ""),
-        recommendations=obj.get("recommendations", ""),
-        farmer_loan_adjustments=obj.get("farmer_loan_adjustments", ""),
-        methodology=obj.get("methodology", ""),
+        executive_summary=_coerce_text(obj.get("executive_summary", "")),
+        situation_analysis=_coerce_text(obj.get("situation_analysis", "")),
+        food_security_assessment=_coerce_text(obj.get("food_security_assessment", "")),
+        displacement_analysis=_coerce_text(obj.get("displacement_analysis", "")),
+        risk_assessment=_coerce_text(obj.get("risk_assessment", "")),
+        safe_routes_analysis=_coerce_text(obj.get("safe_routes_analysis", "")),
+        recommendations=_coerce_text(obj.get("recommendations", "")),
+        farmer_loan_adjustments=_coerce_text(obj.get("farmer_loan_adjustments", "")),
+        methodology=_coerce_text(obj.get("methodology", "")),
         references=uris,
-        state_annexes=obj.get("state_annexes", {}) if include_annexes else {},
+        state_annexes=_coerce_annexes(obj.get("state_annexes", {})) if include_annexes else {},
     )
 
 
