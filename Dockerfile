@@ -27,4 +27,4 @@ ENV PORT=8080
 
 EXPOSE ${PORT}
 
-CMD ["bash", "-lc", "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8080}"]
+CMD ["bash", "-lc", "gunicorn -k uvicorn.workers.UvicornWorker app.main:app --bind 0.0.0.0:$PORT"]
