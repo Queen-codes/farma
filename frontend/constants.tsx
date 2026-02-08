@@ -5,7 +5,9 @@ export const FOCUS_STATES = ['Borno', 'Adamawa', 'Yobe', 'Bauchi', 'Gombe', 'Tar
 
 export const FARMA_API_KEY = "c43d3a97718b8567b1e059f570fd490174131e349f5669914ea40299c3cb8524";
 
-export const API_BASE_URL = 'https://farma-782700364357.us-central1.run.app';
+// Prefer same-origin API calls (Firebase Hosting rewrite -> Cloud Run).
+// Override with VITE_API_BASE_URL only when explicitly needed.
+export const API_BASE_URL = (import.meta as any).env?.VITE_API_BASE_URL || '';
 
 export const Icons = {
   Scan: () => (

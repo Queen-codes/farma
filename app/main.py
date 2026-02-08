@@ -33,8 +33,10 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",
         "http://localhost:5173",
+        "https://gen-lang-client-0340377833.web.app",
+        "https://gen-lang-client-0340377833.firebaseapp.com",
     ],
-    allow_origin_regex=r"^https://([a-zA-Z0-9-]+\.)*(vercel\.app|aistudio\.google\.com)$",
+    allow_origin_regex=r"^https://([a-zA-Z0-9-]+\.)*(vercel\.app|aistudio\.google\.com|web\.app|firebaseapp\.com)$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
