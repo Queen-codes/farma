@@ -9,6 +9,7 @@ Used by:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,9 +27,12 @@ class ReportDAGConfig:
     thinking_level: str = "low"
     temperature: float = 0.3
 
-    image_model: str = "gemini-3-pro-image-preview"
-    image_aspect_ratio: str = "16:9"
-    image_size: str = "2K"
+    image_model: str = os.getenv("GEMINI_MODEL_REPORT_IMAGE", "gemini-3-pro-preview")
+    image_fallback_model: str = os.getenv(
+        "GEMINI_MODEL_REPORT_IMAGE_FALLBACK", "gemini-3-pro-image-preview"
+    )
+    image_aspect_ratio: str = os.getenv("GEMINI_REPORT_IMAGE_ASPECT_RATIO", "16:9")
+    image_size: str = os.getenv("GEMINI_REPORT_IMAGE_SIZE", "2K")
     image_concurrency: int = 2
 
     cache_dir: Path = REPORTS_DIR / "_aegis_cache" / "infographics"

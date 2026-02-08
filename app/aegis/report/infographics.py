@@ -15,6 +15,7 @@ Assumptions:
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, Optional
@@ -26,6 +27,8 @@ from app.config import GOOGLE_API_KEY
 from app.aegis.report.cache import CacheKey, InfographicCache
 from app.aegis.report.config import ReportDAGConfig
 from app.aegis.report.report_data import ReportData
+
+logger = logging.getLogger(__name__)
 
 
 class InfographicType(str, Enum):
@@ -73,6 +76,87 @@ def _extract_text(resp: Any) -> str:
         return (resp.text or "").strip()
     except Exception:
         return ""
+
+
+def _is_invalid_argument_error(exc: Exception) -> bool:
+    """Return True when exception appears to be Gemini INVALID_ARGUMENT."""
+    text = str(exc).upper()
+    return "INVALID_ARGUMENT" in text or " 400 " in text or text.startswith("400 ")
+
+
+def _image_model_attempts(config: ReportDAGConfig) -> list[str]:
+    """Return ordered deduplicated image-model attempts."""
+    attempts = [config.image_model]
+    fallback = (config.image_fallback_model or "").strip()
+    if fallback and fallback not in attempts:
+        attempts.append(fallback)
+    return attempts
+
+
+def _gen_config_attempts(config: ReportDAGConfig) -> list[types.GenerateContentConfig]:
+    """Build progressively permissive generate-content configs."""
+    aspect = (config.image_aspect_ratio or "").strip() or None
+    size = (config.image_size or "").strip() or None
+    cfgs: list[types.GenerateContentConfig] = []
+
+    # Strict request: text companion + explicit image shape/size.
+    cfgs.append(
+        types.GenerateContentConfig(
+            response_modalities=["TEXT", "IMAGE"],
+            image_config=types.ImageConfig(
+                aspect_ratio=aspect,
+                image_size=size,
+            ),
+        )
+    )
+    # Fallback: IMAGE only with explicit shape.
+    cfgs.append(
+        types.GenerateContentConfig(
+            response_modalities=["IMAGE"],
+            image_config=types.ImageConfig(
+                aspect_ratio=aspect,
+                image_size=size,
+            ),
+        )
+    )
+    # Fallback: IMAGE only with model defaults.
+    cfgs.append(types.GenerateContentConfig(response_modalities=["IMAGE"]))
+    return cfgs
+
+
+async def _generate_with_fallback(
+    *,
+    client: genai.Client,
+    prompt: str,
+    config: ReportDAGConfig,
+) -> Any:
+    """Generate image response using model/config retries for invalid-arg errors."""
+    errors: list[str] = []
+    last_exc: Exception | None = None
+
+    for model_name in _image_model_attempts(config):
+        for cfg in _gen_config_attempts(config):
+            try:
+                return await client.aio.models.generate_content(
+                    model=model_name,
+                    contents=prompt,
+                    config=cfg,
+                )
+            except Exception as exc:
+                last_exc = exc
+                if _is_invalid_argument_error(exc):
+                    errors.append(f"{model_name}: {exc}")
+                    continue
+                raise
+
+    if errors:
+        logger.warning(
+            "[AEGIS/REPORT] Infographic generation invalid-argument retries exhausted: %s",
+            " | ".join(errors[-3:]),
+        )
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Infographic generation failed without response")
 
 
 def _prompt_payload(report_data: ReportData) -> Dict[str, Any]:
@@ -346,16 +430,10 @@ async def generate_infographic_cached(
     client = _client()
 
     async with semaphore:
-        resp = await client.aio.models.generate_content(
-            model=config.image_model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_modalities=["TEXT", "IMAGE"],
-                image_config=types.ImageConfig(
-                    aspect_ratio=config.image_aspect_ratio,
-                    image_size=config.image_size,
-                ),
-            ),
+        resp = await _generate_with_fallback(
+            client=client,
+            prompt=prompt,
+            config=config,
         )
 
     image_bytes = _extract_first_image_bytes(resp)

@@ -83,6 +83,10 @@ async def _fallback_underwriting_decision(
         requested_amount = 0
 
     risky_flags = {"SYSTEM_ERROR", "SCORING_ERROR", "LOCATION_VAGUE", "LOCATION_REVIEW_REQUIRED"}
+    # If farmer provided location text, don't block on location flags — they gave us something to work with
+    location_text = (parsed.get("location") or parsed.get("farm_location") or "").strip()
+    if location_text:
+        risky_flags = {"SYSTEM_ERROR", "SCORING_ERROR"}
     has_high_risk = any(flag in risky_flags for flag in existing_flags)
 
     if requested_amount <= 0:
@@ -107,8 +111,10 @@ async def _fallback_underwriting_decision(
         }
 
     if has_high_risk:
-        question = await translate_to_farmer_language(
-            "We need one more location detail before disbursement. Reply with your ward/village and nearest market.",
+        reason_text = "Your loan request is on hold due to a system verification issue."
+        question_text = "We will review and get back to you shortly. No action needed from you."
+        sms = await translate_to_farmer_language(
+            f"{reason_text} {question_text}",
             language,
             context="loan_verification",
         )
@@ -121,10 +127,10 @@ async def _fallback_underwriting_decision(
                 "repayment_schedule": "weekly",
                 "requires_field_verification": True,
             },
-            "reasoning": ["Risk flags require human/location verification."],
+            "reasoning": ["System/scoring error requires internal verification before disbursement."],
             "risk_flags": list(dict.fromkeys(existing_flags + ["VERIFICATION_REQUIRED"])),
-            "follow_up_questions": [question[:160]],
-            "sms_160": question[:160],
+            "follow_up_questions": [],
+            "sms_160": sms[:160],
         }
 
     approved = min(max(requested_amount, policy["min_amount_naira"]), policy["max_amount_naira"])
@@ -198,7 +204,7 @@ async def loan_underwriter_node(state: FarmaState) -> dict:
         "Return JSON ONLY matching the schema.\n\n"
         "HARD RULES:\n"
         "1) Do NOT browse.\n"
-        "2) If location confidence is low OR satellite evidence is missing/contradictory, choose HOLD_FOR_VERIFICATION.\n"
+        "2) If location is completely missing, choose HOLD_FOR_VERIFICATION. If location text was provided but confidence is low, proceed with FIELD_VERIFICATION or APPROVE_SMALL — do NOT ask the farmer for location again.\n"
         "3) Follow-up questions must be answerable by SMS (no rainfall requests, no GPS-only requirements).\n"
         "4) sms_160 must be <=160 characters and in the farmer's language/dialect.\n"
         "5) Keep reasoning to max 6 short bullets.\n\n"

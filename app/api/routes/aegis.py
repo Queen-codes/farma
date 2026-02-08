@@ -549,18 +549,44 @@ async def run_marathon_day_endpoint(
         Latency:
             Potentially high for LLM-heavy continuity analysis.
         """
-        await run_marathon_day(
-            run_id=run_id,
-            track_id=payload.track_id,
-            day_date=day_date,
-            scan_id=int(payload.scan_id) if payload.scan_id else None,
-            prev_scan_id=int(payload.prev_scan_id) if payload.prev_scan_id else None,
-            mode=mode,
-            config={
-                "model": os.getenv("GEMINI_MODEL_MARATHON", "gemini-3-flash-preview"),
-            },
-            emit_job_events=True,
-        )
+        try:
+            await run_marathon_day(
+                run_id=run_id,
+                track_id=payload.track_id,
+                day_date=day_date,
+                scan_id=int(payload.scan_id) if payload.scan_id else None,
+                prev_scan_id=int(payload.prev_scan_id) if payload.prev_scan_id else None,
+                mode=mode,
+                config={
+                    "model": os.getenv("GEMINI_MODEL_MARATHON", "gemini-3-flash-preview"),
+                },
+                emit_job_events=True,
+            )
+        except Exception as exc:
+            # Guard against dangling "running" marathon jobs if runner fails before finalize.
+            try:
+                await job_store.update_job(
+                    run_id,
+                    status="failed",
+                    result={
+                        "error": str(exc),
+                        "track_id": payload.track_id,
+                        "day_date": day_date,
+                    },
+                    completed_at=utcnow_naive(),
+                )
+            except Exception:
+                pass
+            try:
+                await job_store.add_event(
+                    run_id,
+                    event_type="marathon_failed",
+                    status="failed",
+                    step="marathon_error",
+                    message=str(exc),
+                )
+            except Exception:
+                pass
 
     spawn_bg_task(request.app, _bg())
     return AegisMarathonRunResponse(
