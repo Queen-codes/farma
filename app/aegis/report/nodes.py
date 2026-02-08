@@ -221,14 +221,34 @@ async def generate_infographics_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     cfg = ReportDAGConfig()
     _emit("infographics_started", step="infographics", payload={"scan_id": rd.scan_id})
-    imgs = await generate_all_infographics(report_data=rd, config=cfg)
+    imgs, img_errors = await generate_all_infographics(report_data=rd, config=cfg)
+    if img_errors:
+        _emit(
+            "infographics_degraded",
+            status="completed",
+            step="infographics",
+            message="One or more infographics failed; using text-only fallback for missing visuals",
+            payload={
+                "scan_id": rd.scan_id,
+                "failed_types": sorted(img_errors.keys()),
+                "failed_count": len(img_errors),
+            },
+        )
     _emit(
         "infographics_completed",
         status="completed",
         step="infographics",
-        payload={"scan_id": rd.scan_id, "count": len(imgs)},
+        payload={
+            "scan_id": rd.scan_id,
+            "count": len(imgs),
+            "failed_count": len(img_errors),
+        },
     )
-    return {"infographics": {k: v.file_path for k, v in imgs.items()}}
+    return {
+        "infographics": {k: v.file_path for k, v in imgs.items()},
+        "infographics_errors": img_errors,
+        "infographics_generated_count": len(imgs),
+    }
 
 
 async def build_pdf_node(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -311,4 +331,10 @@ async def persist_report_node(state: Dict[str, Any]) -> Dict[str, Any]:
         step="report_complete",
         payload={"scan_id": scan_id, "pdf_path": pdf_path, "gcs_key": gcs_key},
     )
-    return {"status": "completed", "sources_cited": sources_cited, "gcs_key": gcs_key}
+    return {
+        "status": "completed",
+        "sources_cited": sources_cited,
+        "gcs_key": gcs_key,
+        "infographics_generated": int(state.get("infographics_generated_count") or 0),
+        "infographics_errors": state.get("infographics_errors") or {},
+    }

@@ -453,23 +453,38 @@ async def generate_all_infographics(
     *,
     report_data: ReportData,
     config: ReportDAGConfig,
-) -> Dict[str, GeneratedInfographic]:
-    """Generate all infographic variants concurrently with bounded concurrency."""
+) -> tuple[Dict[str, GeneratedInfographic], Dict[str, str]]:
+    """Generate infographic variants with best-effort fallback on per-image failures.
+
+    Returns:
+        Tuple of:
+        - generated infographic map keyed by type name
+        - error map keyed by type name for failed generations
+    """
     cache = InfographicCache(config.cache_dir)
     sem = asyncio.Semaphore(max(1, int(config.image_concurrency)))
 
-    async def _one(t: InfographicType) -> tuple[str, GeneratedInfographic]:
-        """Generate one infographic and return `(type_name, metadata)` tuple."""
-        res = await generate_infographic_cached(
-            report_data=report_data,
-            infographic_type=t,
-            config=config,
-            cache=cache,
-            semaphore=sem,
-        )
-        return t.value, res
+    generated: Dict[str, GeneratedInfographic] = {}
+    errors: Dict[str, str] = {}
 
-    pairs = await asyncio.gather(
-        *[_one(t) for t in InfographicType], return_exceptions=False
-    )
-    return {k: v for k, v in pairs}
+    async def _one(t: InfographicType) -> None:
+        """Generate one infographic and collect success/error in shared maps."""
+        try:
+            res = await generate_infographic_cached(
+                report_data=report_data,
+                infographic_type=t,
+                config=config,
+                cache=cache,
+                semaphore=sem,
+            )
+            generated[t.value] = res
+        except Exception as exc:
+            errors[t.value] = str(exc)
+            logger.warning(
+                "[AEGIS/REPORT] Infographic '%s' degraded to text-only: %s",
+                t.value,
+                exc,
+            )
+
+    await asyncio.gather(*[_one(t) for t in InfographicType], return_exceptions=False)
+    return generated, errors

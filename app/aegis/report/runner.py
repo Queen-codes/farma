@@ -138,6 +138,7 @@ async def run_report_dag(
     pdf_path = (final_state or {}).get("pdf_path")
     gcs_key = (final_state or {}).get("gcs_key")
     sources_cited = (final_state or {}).get("sources_cited")
+    infographics_generated = int((final_state or {}).get("infographics_generated") or 0)
     return {
         "report_id": report_id,
         "scan_id": int(scan_id),
@@ -146,4 +147,5 @@ async def run_report_dag(
         "gcs_key": gcs_key,
         "states_analyzed": states,
         "sources_cited": int(sources_cited or 0),
+        "infographics_generated": infographics_generated,
     }
