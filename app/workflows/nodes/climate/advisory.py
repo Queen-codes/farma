@@ -92,7 +92,7 @@ async def gemini_climate_advisory(state: FarmaState) -> dict:
                 thinking_level="low",
                 temperature=0.2,
                 schema=schema,
-                timeout_s=7.5,
+                timeout_s=15.0,
             )
         except Exception as e:
             msg_e = str(e)
