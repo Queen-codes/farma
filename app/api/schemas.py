@@ -448,6 +448,28 @@ class AegisMarathonRunResponse(BaseModel):
     actions_taken: List[str] = Field(default_factory=list)
 
 
+class AegisDemoRunRequest(BaseModel):
+    """Input payload for one-click end-to-end demo orchestration."""
+
+    track_id: Optional[str] = None
+    states: Optional[List[str]] = None
+    days_back: int = Field(default=7, ge=1, le=365)
+    force_refresh: bool = False
+    include_infographics: bool = False
+    include_annexes: bool = True
+    simulation_scenario: Optional[Dict[str, Any]] = None
+
+
+class AegisDemoRunResponse(BaseModel):
+    """Immediate response returned when demo orchestrator run is queued."""
+
+    run_id: str
+    status: JobStatus
+    track_id: str
+    period_key: str
+    message: str
+
+
 class AegisMarathonDayResponse(BaseModel):
     """Persisted per-day marathon record exposed in timeline responses."""
 
@@ -491,6 +513,21 @@ class AegisMarathonTimelineResponse(BaseModel):
     total_days: int = 0
     total_self_corrections: int = 0
     total_actions: int = 0
+
+
+class AegisPipelineReadinessResponse(BaseModel):
+    """Readiness snapshot for stage gating by scan ID."""
+
+    scan_id: int
+    scan_exists: bool = False
+    scan_status: str = "unknown"
+    has_rollup_json: bool = False
+    assessments_count: int = 0
+    synthesis_ready: bool = False
+    simulation_ready: bool = False
+    report_ready: bool = False
+    marathon_ready: bool = False
+    missing_requirements: List[str] = Field(default_factory=list)
 
 
 class AegisSimulationRequest(BaseModel):

@@ -121,6 +121,21 @@ async def aegis_risk_check_node(state: FarmaState) -> dict:
     """
     emit_event("aegis_started", step="aegis_risk_check")
 
+    if state.get("use_aegis_context") is False:
+        emit_event(
+            "aegis_skipped",
+            status="completed",
+            step="aegis_risk_check",
+            payload={"aegis_available": False, "reason": "disabled_for_run"},
+        )
+        return {
+            "aegis_context": {
+                "aegis_available": False,
+                "disabled": True,
+                "message": "AEGIS intelligence disabled for this run",
+            }
+        }
+
     coords = state.get("coordinates") or {}
     location_state = (coords.get("state") or "").strip() or None
     lga = (coords.get("lga") or "").strip() or None

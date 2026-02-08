@@ -35,10 +35,13 @@ from app.api.helpers.runtime import spawn_bg_task, utcnow_naive
 from app.api.helpers.security import require_api_auth
 from app.api.schemas import (
     AegisDashboardResponse,
+    AegisDemoRunRequest,
+    AegisDemoRunResponse,
     AegisMarathonDayResponse,
     AegisMarathonRunRequest,
     AegisMarathonRunResponse,
     AegisMarathonTimelineResponse,
+    AegisPipelineReadinessResponse,
     AegisReportRequest,
     AegisReportResponse,
     AegisReportStatusResponse,
@@ -57,13 +60,161 @@ from app.api.schemas import (
     StateIntelligenceSummary,
 )
 from app.config import AEGIS_FOCUS_STATES
-from app.utils.job_store import job_store
+from app.utils.job_store import JobRun, job_store
 
 router = APIRouter(
     prefix="/api/aegis",
     tags=["AEGIS"],
     dependencies=[Depends(require_api_auth)],
 )
+
+
+def _normalize_states(states: list[str]) -> list[str]:
+    """Return sorted unique normalized state labels."""
+    out = []
+    for s in states:
+        ss = str(s or "").strip()
+        if ss:
+            out.append(ss)
+    return sorted(set(out))
+
+
+def _scan_period_key(days_back: int) -> str:
+    """Build deterministic period key used for scan idempotency."""
+    now = datetime.now(timezone.utc)
+    if int(days_back) >= 7:
+        iso = now.isocalendar()
+        return f"{iso.year}-W{iso.week:02d}"
+    return now.strftime("%Y-%m-%d")
+
+
+def _period_day_date(days_back: int) -> str:
+    """Return canonical day_date label used by marathon continuity."""
+    now = datetime.now(timezone.utc)
+    if int(days_back) >= 7:
+        monday = now.date().fromordinal(now.date().toordinal() - now.weekday())
+        return monday.isoformat()
+    return now.strftime("%Y-%m-%d")
+
+
+async def _scan_readiness_snapshot(scan_id: int) -> dict[str, Any]:
+    """Compute readiness booleans for a scan-backed pipeline cycle."""
+    from app.aegis.db.connection import get_async_session
+    from app.aegis.db.models import AegisScan, StateIntelligence
+    from sqlalchemy import select
+
+    missing: list[str] = []
+    scan_exists = False
+    scan_status = "unknown"
+    has_rollup_json = False
+    assessments_count = 0
+
+    async with get_async_session() as session:
+        scan = await session.get(AegisScan, int(scan_id))
+        if scan:
+            scan_exists = True
+            scan_status = str(scan.status or "unknown").lower()
+            has_rollup_json = bool(scan.rollup_json)
+
+            res = await session.execute(
+                select(StateIntelligence).where(StateIntelligence.scan_id == int(scan_id))
+            )
+            assessments = [
+                row
+                for row in res.scalars().all()
+                if getattr(row, "assessment_json", None)
+            ]
+            assessments_count = len(assessments)
+
+    if not scan_exists:
+        missing.append("scan_not_found")
+    else:
+        if scan_status != "completed":
+            missing.append("scan_not_completed")
+        if not has_rollup_json:
+            missing.append("missing_rollup_json")
+        if assessments_count <= 0:
+            missing.append("missing_state_assessments")
+
+    synthesis_ready = scan_exists and not missing
+    return {
+        "scan_id": int(scan_id),
+        "scan_exists": scan_exists,
+        "scan_status": scan_status,
+        "has_rollup_json": has_rollup_json,
+        "assessments_count": assessments_count,
+        "synthesis_ready": synthesis_ready,
+        "simulation_ready": synthesis_ready,
+        "report_ready": synthesis_ready,
+        "marathon_ready": synthesis_ready,
+        "missing_requirements": missing,
+    }
+
+
+async def _find_reusable_scan(
+    *,
+    states: list[str],
+    days_back: int,
+    period_key: str,
+) -> Optional[dict[str, Any]]:
+    """Find a completed scan job in the same period and state set."""
+    from app.aegis.db.connection import get_async_session
+    from app.aegis.db.models import AegisScan, StateIntelligence
+    from sqlalchemy import desc, select
+
+    target_states = _normalize_states(states)
+    async with get_async_session() as session:
+        res = await session.execute(
+            select(JobRun)
+            .where(
+                JobRun.job_type == "aegis_scan",
+                JobRun.status == "completed",
+            )
+            .order_by(desc(JobRun.started_at))
+            .limit(40)
+        )
+        rows = res.scalars().all()
+
+        for row in rows:
+            metadata = row.job_metadata or {}
+            row_days_back = int(metadata.get("days_back") or 0)
+            row_period_key = str(metadata.get("period_key") or "")
+            row_states = _normalize_states(metadata.get("states") or [])
+
+            if row_days_back != int(days_back):
+                continue
+            if row_period_key != str(period_key):
+                continue
+            if row_states != target_states:
+                continue
+
+            result = row.result or {}
+            candidate_scan_id = int(result.get("scan_id") or metadata.get("scan_id") or 0)
+            if candidate_scan_id <= 0:
+                continue
+
+            scan = await session.get(AegisScan, candidate_scan_id)
+            if not scan or str(scan.status or "").lower() != "completed":
+                continue
+
+            st_res = await session.execute(
+                select(StateIntelligence.state_name).where(
+                    StateIntelligence.scan_id == candidate_scan_id
+                )
+            )
+            found_states = _normalize_states(
+                [r[0] for r in st_res.all() if r and r[0]]
+            )
+            if found_states and found_states != target_states:
+                continue
+
+            return {
+                "scan_id": int(candidate_scan_id),
+                "run_id": str(row.job_id),
+                "period_key": str(period_key),
+            }
+
+    return None
 
 
 @router.post("/seed-demo")
@@ -231,6 +382,27 @@ async def trigger_aegis_scan(
 
     states = payload.states or AEGIS_FOCUS_STATES
     days_back = getattr(payload, "days_back", 7) or 7
+    period_key = _scan_period_key(int(days_back))
+    normalized_states = _normalize_states(states)
+
+    if not bool(payload.force_refresh):
+        reusable = await _find_reusable_scan(
+            states=normalized_states,
+            days_back=int(days_back),
+            period_key=period_key,
+        )
+        if reusable:
+            return AegisScanResponse(
+                scan_id=int(reusable["scan_id"]),
+                run_id=str(reusable["run_id"]),
+                status="completed",
+                states_to_scan=normalized_states,
+                message=(
+                    f"Reusing completed scan for period {period_key}. "
+                    "Use force_refresh=true to create a fresh scan."
+                ),
+            )
+
     run_id = f"SCAN-{uuid.uuid4().hex[:8].upper()}"
     scan_db_id = 0
     try:
@@ -255,7 +427,12 @@ async def trigger_aegis_scan(
     await job_store.create_job(
         run_id,
         "aegis_scan",
-        metadata={"states": states, "scan_id": scan_db_id, "days_back": days_back},
+        metadata={
+            "states": normalized_states,
+            "scan_id": scan_db_id,
+            "days_back": int(days_back),
+            "period_key": period_key,
+        },
     )
     await job_store.add_event(
         run_id,
@@ -263,7 +440,7 @@ async def trigger_aegis_scan(
         status="running",
         step="scan_start",
         message="AEGIS scan started",
-        payload={"states": states},
+        payload={"states": normalized_states, "period_key": period_key},
     )
 
     async def run_scan_background() -> None:
@@ -286,7 +463,7 @@ async def trigger_aegis_scan(
         """
         try:
             result = await run_aegis_scan(
-                states=states,
+                states=normalized_states,
                 days_back=days_back,
                 force=payload.force_refresh,
                 run_id=run_id,
@@ -346,7 +523,7 @@ async def trigger_aegis_scan(
         scan_id=scan_db_id,
         run_id=run_id,
         status="running",
-        states_to_scan=states,
+        states_to_scan=normalized_states,
         message=f"Scan initiated. Poll /api/aegis/scan/{run_id} for status.",
     )
 
@@ -474,6 +651,458 @@ async def trigger_aegis_synthesis(
     )
 
 
+@router.get(
+    "/pipeline/readiness/{scan_id}", response_model=AegisPipelineReadinessResponse
+)
+async def get_pipeline_readiness(scan_id: int) -> AegisPipelineReadinessResponse:
+    """Return stage-readiness booleans for a scan-backed pipeline cycle.
+
+    Request:
+        Path parameter `scan_id` is required.
+
+    Response:
+        `AegisPipelineReadinessResponse` indicating whether synthesis-backed
+        stages (simulation/report/marathon) can run safely.
+
+    Status Codes:
+        200: Readiness returned (including scan-not-found cases).
+
+    Auth:
+        Requires valid API token via `require_api_auth`.
+
+    Idempotency:
+        Idempotent read endpoint.
+
+    Args:
+        scan_id: Numeric scan identifier.
+
+    Returns:
+        AegisPipelineReadinessResponse: Readiness snapshot.
+    """
+    snap = await _scan_readiness_snapshot(int(scan_id))
+    return AegisPipelineReadinessResponse(**snap)
+
+
+@router.post("/demo/run", response_model=AegisDemoRunResponse)
+async def run_demo_orchestrator(
+    payload: AegisDemoRunRequest, request: Request
+) -> AegisDemoRunResponse:
+    """Run a one-click end-to-end demo cycle with a single parent job stream.
+
+    Flow:
+        seed-if-needed -> scan(reuse-or-run) -> synthesis(check-or-run) ->
+        simulation -> report -> marathon append -> timeline snapshot.
+    """
+    from app.aegis.graph import run_aegis_scan
+    from app.aegis.marathon.runner import run_marathon_day
+    from app.aegis.report.runner import run_report_dag
+    from app.aegis.simulator.runner import run_simulation_dag
+    from app.aegis.synthesis.runner import run_synthesis_dag
+
+    states = _normalize_states(payload.states or AEGIS_FOCUS_STATES)
+    days_back = int(payload.days_back or 7)
+    period_key = _scan_period_key(days_back)
+    day_date = _period_day_date(days_back)
+    track_id = str(payload.track_id or f"demo-track-{period_key}")
+    run_id = f"DEMO-{uuid.uuid4().hex[:8].upper()}"
+
+    await job_store.create_job(
+        run_id,
+        "aegis_demo",
+        metadata={
+            "states": states,
+            "days_back": days_back,
+            "period_key": period_key,
+            "track_id": track_id,
+        },
+    )
+    await job_store.add_event(
+        run_id,
+        event_type="demo_started",
+        status="running",
+        step="demo_start",
+        message="AEGIS one-click demo orchestration started",
+        payload={
+            "states": states,
+            "days_back": days_back,
+            "period_key": period_key,
+            "track_id": track_id,
+        },
+    )
+
+    async def _bg() -> None:
+        from sqlalchemy import select
+
+        from app.aegis.db.connection import get_async_session
+        from app.aegis.db.models import AegisScan
+
+        scan_id = 0
+        scan_run_id = ""
+        simulation_id = ""
+        simulation_run_id = ""
+        report_id = ""
+        marathon_run_id = ""
+
+        try:
+            # 1) Seed demo baseline if missing
+            async with get_async_session() as session:
+                seeded = await session.execute(
+                    select(AegisScan.run_id).where(
+                        AegisScan.run_id.in_(
+                            ["SCAN-DEMO-W1", "SCAN-DEMO-W2", "SCAN-DEMO-W3"]
+                        )
+                    )
+                )
+                found = {str(r[0]) for r in seeded.all() if r and r[0]}
+            if len(found) < 3:
+                await job_store.add_event(
+                    run_id,
+                    event_type="demo.seed_started",
+                    status="running",
+                    step="seed",
+                    message="Seeding baseline demo scans",
+                )
+                from scripts.seed_marathon_demo import seed
+
+                await seed()
+                await job_store.add_event(
+                    run_id,
+                    event_type="demo.seed_completed",
+                    status="completed",
+                    step="seed",
+                    message="Baseline demo scans seeded",
+                )
+            else:
+                await job_store.add_event(
+                    run_id,
+                    event_type="demo.seed_skipped",
+                    status="completed",
+                    step="seed",
+                    message="Baseline demo scans already present",
+                )
+
+            # 2) Scan (reuse unless forced)
+            reusable = None
+            if not bool(payload.force_refresh):
+                reusable = await _find_reusable_scan(
+                    states=states,
+                    days_back=days_back,
+                    period_key=period_key,
+                )
+            if reusable:
+                scan_id = int(reusable["scan_id"])
+                scan_run_id = str(reusable["run_id"])
+                await job_store.add_event(
+                    run_id,
+                    event_type="demo.scan_reused",
+                    status="completed",
+                    step="scan",
+                    message=f"Reused completed scan {scan_id} for period {period_key}",
+                    payload={"scan_id": scan_id, "scan_run_id": scan_run_id},
+                )
+            else:
+                scan_run_id = f"SCAN-{uuid.uuid4().hex[:8].upper()}"
+                scan_db_id = 0
+                async with get_async_session() as session:
+                    scan = AegisScan(
+                        run_id=scan_run_id,
+                        started_at=utcnow_naive(),
+                        status="running",
+                        states_scanned=0,
+                        total_events=0,
+                        total_fatalities=0,
+                    )
+                    session.add(scan)
+                    await session.flush()
+                    scan_db_id = int(scan.id)
+
+                await job_store.create_job(
+                    scan_run_id,
+                    "aegis_scan",
+                    metadata={
+                        "states": states,
+                        "scan_id": scan_db_id,
+                        "days_back": days_back,
+                        "period_key": period_key,
+                    },
+                )
+                await job_store.add_event(
+                    run_id,
+                    event_type="demo.scan_started",
+                    status="running",
+                    step="scan",
+                    message=f"Running fresh scan {scan_run_id}",
+                    payload={"scan_id": scan_db_id},
+                )
+                scan_result = await run_aegis_scan(
+                    states=states,
+                    days_back=days_back,
+                    force=bool(payload.force_refresh),
+                    run_id=scan_run_id,
+                    scan_id=scan_db_id,
+                )
+                if (scan_result.get("status") or "").lower() == "failed":
+                    raise RuntimeError(str(scan_result.get("error") or "scan_failed"))
+                await job_store.update_job(
+                    scan_run_id,
+                    status="completed",
+                    result=scan_result,
+                    completed_at=utcnow_naive(),
+                )
+                scan_id = int(scan_result.get("scan_id") or scan_db_id or 0)
+                await job_store.add_event(
+                    run_id,
+                    event_type="demo.scan_completed",
+                    status="completed",
+                    step="scan",
+                    message=f"Scan completed (scan_id={scan_id})",
+                    payload={"scan_id": scan_id, "scan_run_id": scan_run_id},
+                )
+
+            if scan_id <= 0:
+                raise RuntimeError("Could not resolve scan_id for demo run")
+
+            # 3) Synthesis (skip when already ready)
+            readiness = await _scan_readiness_snapshot(scan_id)
+            if bool(readiness.get("synthesis_ready")):
+                await job_store.add_event(
+                    run_id,
+                    event_type="demo.synthesis_skipped",
+                    status="completed",
+                    step="synthesis",
+                    message="Synthesis artifacts already present",
+                    payload={"scan_id": scan_id},
+                )
+            else:
+                synth_run_id = f"SYNTH-{uuid.uuid4().hex[:8].upper()}"
+                await job_store.create_job(
+                    synth_run_id,
+                    "aegis_synthesis",
+                    metadata={"scan_id": scan_id, "states": states},
+                )
+                await job_store.add_event(
+                    run_id,
+                    event_type="demo.synthesis_started",
+                    status="running",
+                    step="synthesis",
+                    payload={"scan_id": scan_id},
+                )
+                synth_result = await run_synthesis_dag(
+                    scan_id=int(scan_id),
+                    states=states,
+                    run_id=synth_run_id,
+                    emit_job_events=False,
+                )
+                await job_store.update_job(
+                    synth_run_id,
+                    status="completed",
+                    result=synth_result,
+                    completed_at=utcnow_naive(),
+                )
+                readiness = await _scan_readiness_snapshot(scan_id)
+                if not bool(readiness.get("synthesis_ready")):
+                    raise RuntimeError(
+                        "Synthesis did not produce required rollup/assessments"
+                    )
+                await job_store.add_event(
+                    run_id,
+                    event_type="demo.synthesis_completed",
+                    status="completed",
+                    step="synthesis",
+                    payload={"scan_id": scan_id},
+                )
+
+            # 4) Simulation
+            simulation_id = f"SIM-{uuid.uuid4().hex[:8].upper()}"
+            simulation_run_id = f"DEMO-SIM-{uuid.uuid4().hex[:8].upper()}"
+            scenario = payload.simulation_scenario or {
+                "crisis_type": "conflict",
+                "intensity": 1.5,
+                "duration_days": 7,
+                "geo_scope": {"states": states[:2]},
+            }
+            await job_store.create_job(
+                simulation_run_id,
+                "aegis_simulation",
+                metadata={"scan_id": scan_id, "simulation_id": simulation_id},
+            )
+            await job_store.add_event(
+                run_id,
+                event_type="demo.simulation_started",
+                status="running",
+                step="simulation",
+                payload={"scan_id": scan_id, "simulation_id": simulation_id},
+            )
+            sim_result = await run_simulation_dag(
+                scan_id=int(scan_id),
+                simulation_id=simulation_id,
+                scenario=scenario,
+                run_id=simulation_run_id,
+                emit_job_events=False,
+                config={
+                    "model": os.getenv("GEMINI_MODEL_SIMULATOR", "gemini-3-flash-preview"),
+                    "thinking_level": os.getenv("SIMULATOR_THINKING_LEVEL", "LOW"),
+                },
+            )
+            await job_store.add_event(
+                run_id,
+                event_type="demo.simulation_completed",
+                status="completed",
+                step="simulation",
+                payload={
+                    "scan_id": scan_id,
+                    "simulation_id": simulation_id,
+                    "status": sim_result.get("status"),
+                },
+            )
+
+            # 5) Report
+            report_id = f"RPT-{uuid.uuid4().hex[:8].upper()}"
+            await job_store.create_job(
+                report_id,
+                "aegis_report",
+                metadata={"scan_id": scan_id, "states": states},
+            )
+            await job_store.add_event(
+                run_id,
+                event_type="demo.report_started",
+                status="running",
+                step="report",
+                payload={"scan_id": scan_id, "report_id": report_id},
+            )
+            report_result = await run_report_dag(
+                report_id=report_id,
+                scan_id=int(scan_id),
+                states=states,
+                include_infographics=bool(payload.include_infographics),
+                include_annexes=bool(payload.include_annexes),
+                output_dir=str(REPORTS_DIR),
+                simulation_id=simulation_id,
+                emit_job_events=False,
+            )
+            await job_store.update_job(
+                report_id,
+                status="completed",
+                result=report_result,
+                completed_at=utcnow_naive(),
+            )
+            await job_store.add_event(
+                run_id,
+                event_type="demo.report_completed",
+                status="completed",
+                step="report",
+                payload={
+                    "report_id": report_id,
+                    "pdf_path": report_result.get("pdf_path"),
+                    "infographics_generated": report_result.get(
+                        "infographics_generated"
+                    ),
+                },
+            )
+
+            # 6) Marathon append
+            marathon_run_id = f"MARA-{uuid.uuid4().hex[:8].upper()}"
+            await job_store.create_job(
+                marathon_run_id,
+                "aegis_marathon",
+                metadata={
+                    "track_id": track_id,
+                    "scan_id": scan_id,
+                    "day_date": day_date,
+                },
+            )
+            await job_store.add_event(
+                run_id,
+                event_type="demo.marathon_started",
+                status="running",
+                step="marathon",
+                payload={
+                    "track_id": track_id,
+                    "scan_id": scan_id,
+                    "day_date": day_date,
+                },
+            )
+            marathon_result = await run_marathon_day(
+                run_id=marathon_run_id,
+                track_id=track_id,
+                day_date=day_date,
+                scan_id=int(scan_id),
+                prev_scan_id=None,
+                mode="manual",
+                config={
+                    "model": os.getenv(
+                        "GEMINI_MODEL_MARATHON", "gemini-3-flash-preview"
+                    ),
+                },
+                emit_job_events=False,
+            )
+
+            timeline = await get_marathon_timeline(track_id)
+            result_payload = {
+                "status": "completed",
+                "track_id": track_id,
+                "period_key": period_key,
+                "day_date": day_date,
+                "scan_id": scan_id,
+                "scan_run_id": scan_run_id,
+                "simulation_id": simulation_id,
+                "simulation_run_id": simulation_run_id,
+                "report_id": report_id,
+                "marathon_run_id": marathon_run_id,
+                "marathon_actions": marathon_result.get("actions_taken") or [],
+                "timeline": timeline.model_dump(),
+            }
+            await job_store.update_job(
+                run_id,
+                status="completed",
+                result=result_payload,
+                completed_at=utcnow_naive(),
+            )
+            await job_store.add_event(
+                run_id,
+                event_type="demo_completed",
+                status="completed",
+                step="demo_complete",
+                message="AEGIS one-click demo completed successfully",
+                payload={
+                    "scan_id": scan_id,
+                    "report_id": report_id,
+                    "track_id": track_id,
+                    "timeline_days": timeline.total_days,
+                },
+            )
+        except Exception as exc:
+            await job_store.update_job(
+                run_id,
+                status="failed",
+                result={
+                    "error": str(exc),
+                    "track_id": track_id,
+                    "period_key": period_key,
+                    "scan_id": scan_id or None,
+                    "report_id": report_id or None,
+                    "marathon_run_id": marathon_run_id or None,
+                },
+                completed_at=utcnow_naive(),
+            )
+            await job_store.add_event(
+                run_id,
+                event_type="demo_failed",
+                status="failed",
+                step="demo_error",
+                message=str(exc),
+            )
+
+    spawn_bg_task(request.app, _bg())
+    return AegisDemoRunResponse(
+        run_id=run_id,
+        status=JobStatus.RUNNING,
+        track_id=track_id,
+        period_key=period_key,
+        message="Demo orchestrator started. Poll /api/jobs/{run_id} for progress.",
+    )
+
+
 @router.post("/marathon/run", response_model=AegisMarathonRunResponse)
 async def run_marathon_day_endpoint(
     payload: AegisMarathonRunRequest, request: Request
@@ -525,6 +1154,28 @@ async def run_marathon_day_endpoint(
     # In manual mode, scan_id is required
     if mode == "manual" and payload.scan_id is None:
         raise HTTPException(status_code=422, detail="scan_id is required for manual mode")
+    if payload.scan_id is not None:
+        readiness = await _scan_readiness_snapshot(int(payload.scan_id))
+        if not bool(readiness.get("marathon_ready")):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Marathon prerequisites not met for scan_id "
+                    f"{int(payload.scan_id)}: "
+                    + ", ".join(readiness.get("missing_requirements") or [])
+                ),
+            )
+    if payload.prev_scan_id is not None:
+        prev_readiness = await _scan_readiness_snapshot(int(payload.prev_scan_id))
+        if not bool(prev_readiness.get("marathon_ready")):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Marathon prerequisites not met for prev_scan_id "
+                    f"{int(payload.prev_scan_id)}: "
+                    + ", ".join(prev_readiness.get("missing_requirements") or [])
+                ),
+            )
 
     run_id = f"MARA-{uuid.uuid4().hex[:8].upper()}"
     day_date = payload.day_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -785,6 +1436,15 @@ async def create_simulation(
     from app.aegis.simulator.runner import run_simulation_dag
 
     scan_id = int(payload.scan_id)
+    readiness = await _scan_readiness_snapshot(scan_id)
+    if not bool(readiness.get("simulation_ready")):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Simulation prerequisites not met for scan_id {scan_id}: "
+                + ", ".join(readiness.get("missing_requirements") or [])
+            ),
+        )
     simulation_id = f"SIM-{uuid.uuid4().hex[:8].upper()}"
 
     await job_store.create_job(
@@ -1024,6 +1684,15 @@ async def generate_aegis_report(
     from app.aegis.report.runner import run_report_dag
 
     scan_id = int(payload.scan_id)
+    readiness = await _scan_readiness_snapshot(scan_id)
+    if not bool(readiness.get("report_ready")):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Report prerequisites not met for scan_id {scan_id}: "
+                + ", ".join(readiness.get("missing_requirements") or [])
+            ),
+        )
     report_id = f"RPT-{uuid.uuid4().hex[:8].upper()}"
     await job_store.create_job(
         report_id,

@@ -36,7 +36,7 @@ router = APIRouter(
 
 @router.post("/farmer/simulate", response_model=JobResponse)
 async def simulate_farmer_pipeline(
-    request: Request, phone: str, message: str
+    request: Request, phone: str, message: str, use_aegis_context: bool = True
 ) -> JobResponse:
     """Create a new FARMA simulation job from SMS-style query inputs.
 
@@ -77,7 +77,11 @@ async def simulate_farmer_pipeline(
         Fast request path; long-running work happens asynchronously.
     """
     job_id = f"FARMA-{uuid.uuid4().hex[:8].upper()}"
-    await job_store.create_job(job_id, "farmer_simulation", metadata={"phone": phone})
+    await job_store.create_job(
+        job_id,
+        "farmer_simulation",
+        metadata={"phone": phone, "use_aegis_context": bool(use_aegis_context)},
+    )
 
     sms_input = {
         "input_type": "sms",
@@ -92,6 +96,7 @@ async def simulate_farmer_pipeline(
         "risk_flags": [],
         "analysis_summary": [],
         "history": [],
+        "use_aegis_context": bool(use_aegis_context),
     }
 
     async def run_pipeline() -> None:

@@ -60,6 +60,7 @@ class FarmaState(TypedDict):
     ]  # {zone_name, target_ndvi, expected_seasonality}
     visualization_artifacts: Optional[dict]  # {scatter_plot_path, map_path}
     aegis_context: Optional[dict]
+    use_aegis_context: Optional[bool]
 
     # Final Decisions
     final_decision: Optional[str]  # APPROVED, REJECTED, HELD, ADVICE_ONLY
