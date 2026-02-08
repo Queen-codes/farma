@@ -11,6 +11,10 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+from sqlalchemy import select
+
+from app.aegis.db.connection import get_async_session
+from app.aegis.db.models import AegisScan, StateIntelligence
 from app.utils.job_store import job_store
 from app.aegis.marathon.graph import marathon_graph
 
@@ -40,6 +44,29 @@ def _compact_result(
         "report_triggered": st.get("report_triggered"),
         "status": "completed",
     }
+
+
+async def _preflight_scan_ready(scan_id: int) -> None:
+    """Validate scan has synthesis artifacts required by marathon pipeline."""
+    async with get_async_session() as session:
+        scan = await session.get(AegisScan, int(scan_id))
+        if not scan:
+            raise RuntimeError(f"scan_id {scan_id} not found")
+        if not scan.rollup_json:
+            raise RuntimeError(
+                f"scan_id {scan_id} has no rollup_json (run synthesis first)"
+            )
+
+        res = await session.execute(
+            select(StateIntelligence).where(StateIntelligence.scan_id == int(scan_id))
+        )
+        has_assessment = any(
+            bool(getattr(row, "assessment_json", None)) for row in res.scalars().all()
+        )
+        if not has_assessment:
+            raise RuntimeError(
+                f"scan_id {scan_id} has no assessment_json rows (run synthesis first)"
+            )
 
 
 async def run_marathon_day(
@@ -86,6 +113,11 @@ async def run_marathon_day(
             return
 
     try:
+        if scan_id is not None:
+            await _preflight_scan_ready(int(scan_id))
+        if prev_scan_id is not None:
+            await _preflight_scan_ready(int(prev_scan_id))
+
         initial: Dict[str, Any] = {
             "track_id": track_id,
             "day_date": day_date,
