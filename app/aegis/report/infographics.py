@@ -15,6 +15,7 @@ Assumptions:
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 from dataclasses import dataclass
 from enum import Enum
@@ -57,14 +58,72 @@ def _client() -> genai.Client:
 
 def _extract_first_image_bytes(resp: Any) -> Optional[bytes]:
     """Extract first inline image payload from Gemini response."""
+    def _coerce_image_bytes(value: Any) -> Optional[bytes]:
+        if value is None:
+            return None
+        if isinstance(value, (bytes, bytearray)):
+            return bytes(value)
+        if isinstance(value, memoryview):
+            return value.tobytes()
+        if isinstance(value, str):
+            txt = value.strip()
+            if not txt:
+                return None
+            try:
+                decoded = base64.b64decode(txt, validate=False)
+                if decoded:
+                    return decoded
+            except Exception:
+                return None
+            return None
+        if isinstance(value, dict):
+            for key in ("data", "bytes_base64_encoded", "bytesBase64Encoded"):
+                if key in value:
+                    out = _coerce_image_bytes(value.get(key))
+                    if out:
+                        return out
+        return None
+
     try:
-        cand = resp.candidates[0]
-        for part in cand.content.parts or []:
-            inline = getattr(part, "inline_data", None)
-            if inline and getattr(inline, "data", None):
-                data = inline.data
-                if isinstance(data, (bytes, bytearray)):
-                    return bytes(data)
+        candidates = getattr(resp, "candidates", None) or []
+        for cand in candidates:
+            content = getattr(cand, "content", None)
+            parts = getattr(content, "parts", None)
+            if parts is None and isinstance(content, dict):
+                parts = content.get("parts")
+            for part in parts or []:
+                inline = getattr(part, "inline_data", None)
+                if inline is None and isinstance(part, dict):
+                    inline = part.get("inline_data") or part.get("inlineData")
+
+                if inline is not None:
+                    data = (
+                        inline.get("data")
+                        if isinstance(inline, dict)
+                        else getattr(inline, "data", None)
+                    )
+                    if data is None and isinstance(inline, dict):
+                        data = (
+                            inline.get("bytes_base64_encoded")
+                            or inline.get("bytesBase64Encoded")
+                        )
+                    if data is None:
+                        data = getattr(inline, "bytes_base64_encoded", None)
+                    out = _coerce_image_bytes(data)
+                    if out:
+                        return out
+
+                # Some SDK variants may expose data directly on part payloads.
+                if isinstance(part, dict):
+                    for key in ("data", "bytes_base64_encoded", "bytesBase64Encoded"):
+                        out = _coerce_image_bytes(part.get(key))
+                        if out:
+                            return out
+                else:
+                    for key in ("data", "bytes_base64_encoded"):
+                        out = _coerce_image_bytes(getattr(part, key, None))
+                        if out:
+                            return out
     except Exception:
         return None
     return None
@@ -129,7 +188,7 @@ async def _generate_with_fallback(
     client: genai.Client,
     prompt: str,
     config: ReportDAGConfig,
-) -> Any:
+) -> tuple[Any, bytes]:
     """Generate image response using model/config retries for invalid-arg errors."""
     errors: list[str] = []
     last_exc: Exception | None = None
@@ -137,11 +196,17 @@ async def _generate_with_fallback(
     for model_name in _image_model_attempts(config):
         for cfg in _gen_config_attempts(config):
             try:
-                return await client.aio.models.generate_content(
+                resp = await client.aio.models.generate_content(
                     model=model_name,
                     contents=prompt,
                     config=cfg,
                 )
+                image_bytes = _extract_first_image_bytes(resp)
+                if image_bytes:
+                    return resp, image_bytes
+                # Successful API response but no image payload -> try next attempt.
+                errors.append(f"{model_name}: no_image_bytes")
+                continue
             except Exception as exc:
                 last_exc = exc
                 if _is_invalid_argument_error(exc):
@@ -151,12 +216,12 @@ async def _generate_with_fallback(
 
     if errors:
         logger.warning(
-            "[AEGIS/REPORT] Infographic generation invalid-argument retries exhausted: %s",
+            "[AEGIS/REPORT] Infographic generation retries exhausted: %s",
             " | ".join(errors[-3:]),
         )
     if last_exc:
         raise last_exc
-    raise RuntimeError("Infographic generation failed without response")
+    raise RuntimeError("Infographic generation returned no image bytes across retries")
 
 
 def _prompt_payload(report_data: ReportData) -> Dict[str, Any]:
@@ -430,15 +495,11 @@ async def generate_infographic_cached(
     client = _client()
 
     async with semaphore:
-        resp = await _generate_with_fallback(
+        resp, image_bytes = await _generate_with_fallback(
             client=client,
             prompt=prompt,
             config=config,
         )
-
-    image_bytes = _extract_first_image_bytes(resp)
-    if not image_bytes:
-        raise RuntimeError(f"No image bytes returned for {infographic_type.value}")
 
     cache.write_bytes(key, image_bytes)
     return GeneratedInfographic(

@@ -79,6 +79,62 @@ def _normalize_states(states: list[str]) -> list[str]:
     return sorted(set(out))
 
 
+def _normalize_simulation_scenario(scenario: dict[str, Any]) -> dict[str, Any]:
+    """Normalize simulation scenario payload into canonical simulator schema.
+
+    Accepts legacy keys (`type`, `severity`, `states`) and maps them to:
+    `crisis_type`, `intensity`, `duration_days`, `geo_scope.states`.
+    """
+    raw = dict(scenario or {})
+
+    crisis_type = str(
+        raw.get("crisis_type")
+        or raw.get("type")
+        or raw.get("event_type")
+        or "conflict"
+    ).strip() or "conflict"
+
+    intensity = raw.get("intensity")
+    if intensity is None:
+        sev = str(raw.get("severity") or "").strip().lower()
+        sev_map = {
+            "low": 0.8,
+            "medium": 1.0,
+            "moderate": 1.1,
+            "high": 1.4,
+            "very_high": 1.7,
+            "critical": 2.0,
+        }
+        intensity = sev_map.get(sev, 1.0)
+    try:
+        intensity_val = max(0.1, float(intensity))
+    except Exception:
+        intensity_val = 1.0
+
+    duration = raw.get("duration_days", raw.get("duration", 7))
+    try:
+        duration_days = max(1, int(duration))
+    except Exception:
+        duration_days = 7
+
+    geo_scope = raw.get("geo_scope") if isinstance(raw.get("geo_scope"), dict) else {}
+    states = geo_scope.get("states")
+    if not isinstance(states, list):
+        states = raw.get("states")
+    if not isinstance(states, list):
+        states = []
+    normalized_states = _normalize_states([str(s) for s in states])
+
+    normalized = {
+        **raw,
+        "crisis_type": crisis_type,
+        "intensity": intensity_val,
+        "duration_days": duration_days,
+        "geo_scope": {"states": normalized_states},
+    }
+    return normalized
+
+
 def _scan_period_key(days_back: int) -> str:
     """Build deterministic period key used for scan idempotency."""
     now = datetime.now(timezone.utc)
@@ -1547,6 +1603,7 @@ async def create_simulation(
     from app.aegis.simulator.runner import run_simulation_dag
 
     scan_id = int(payload.scan_id)
+    normalized_scenario = _normalize_simulation_scenario(payload.scenario or {})
     readiness = await _scan_readiness_snapshot(scan_id)
     if not bool(readiness.get("simulation_ready")):
         raise HTTPException(
@@ -1561,7 +1618,11 @@ async def create_simulation(
     await job_store.create_job(
         simulation_id,
         "aegis_simulation",
-        metadata={"scan_id": scan_id, "scenario": payload.scenario},
+        metadata={
+            "scan_id": scan_id,
+            "scenario": normalized_scenario,
+            "scenario_input": payload.scenario,
+        },
     )
 
     async def _bg() -> None:
@@ -1589,7 +1650,7 @@ async def create_simulation(
         await run_simulation_dag(
             scan_id=scan_id,
             simulation_id=simulation_id,
-            scenario=payload.scenario,
+            scenario=normalized_scenario,
             run_id=simulation_id,
             emit_job_events=True,
             config=cfg,

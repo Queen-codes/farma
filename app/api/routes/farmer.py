@@ -42,7 +42,7 @@ async def simulate_farmer_pipeline(
 
     Request:
         Query parameters:
-        - `phone` (required): Farmer phone number / conversation thread ID.
+        - `phone` (required): Farmer phone number.
         - `message` (required): Incoming farmer SMS text.
 
     Response:
@@ -59,7 +59,7 @@ async def simulate_farmer_pipeline(
 
     Args:
         request: FastAPI request object used to access app state for background tasks.
-        phone: Farmer phone number used as workflow thread identifier.
+        phone: Farmer phone number included in workflow input/metadata.
         message: SMS text that seeds the workflow initial state.
 
     Returns:
@@ -77,10 +77,15 @@ async def simulate_farmer_pipeline(
         Fast request path; long-running work happens asynchronously.
     """
     job_id = f"FARMA-{uuid.uuid4().hex[:8].upper()}"
+    thread_id = job_id
     await job_store.create_job(
         job_id,
         "farmer_simulation",
-        metadata={"phone": phone, "use_aegis_context": bool(use_aegis_context)},
+        metadata={
+            "phone": phone,
+            "thread_id": thread_id,
+            "use_aegis_context": bool(use_aegis_context),
+        },
     )
 
     sms_input = {
@@ -124,7 +129,7 @@ async def simulate_farmer_pipeline(
             await run_farma_job(
                 job_id=job_id,
                 initial_state=sms_input,
-                thread_id=phone,
+                thread_id=thread_id,
                 emit_job_events=True,
             )
         except Exception as e:
@@ -210,11 +215,12 @@ async def resume_farmer_pipeline(
             detail=f"Job {job_id} is not awaiting human input (status={status})",
         )
 
-    phone = (job.get("metadata") or {}).get("phone")
-    if not phone:
+    metadata = job.get("metadata") or {}
+    thread_id = metadata.get("thread_id") or metadata.get("phone")
+    if not thread_id:
         raise HTTPException(
             status_code=400,
-            detail=f"Job {job_id} has no phone in metadata — cannot resume",
+            detail=f"Job {job_id} has no thread_id in metadata — cannot resume",
         )
 
     async def _bg() -> None:
@@ -240,7 +246,7 @@ async def resume_farmer_pipeline(
 
             await resume_farma_job(
                 job_id=job_id,
-                thread_id=phone,
+                thread_id=thread_id,
                 human_response=body.response_text,
                 emit_job_events=True,
             )

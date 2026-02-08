@@ -30,7 +30,18 @@ _REPORTS_DIR = _BASE_DIR / "reports"
 _TMP_AUDIO_DIR = _BASE_DIR / "tmp_audio"
 
 
-def _split_prefix(key: str) -> tuple[str, str]:
+def _normalize_key(key: Any) -> str:
+    """Normalize storage key inputs to a safe string."""
+    if isinstance(key, str):
+        return key
+    if isinstance(key, dict):
+        candidate = key.get("key") or key.get("path") or key.get("name")
+        if isinstance(candidate, str):
+            return candidate
+    return str(key or "")
+
+
+def _split_prefix(key: Any) -> tuple[str, str]:
     """Split storage key into root prefix segment and remainder.
 
     Args:
@@ -49,13 +60,14 @@ def _split_prefix(key: str) -> tuple[str, str]:
     Latency:
         Constant-time string splitting.
     """
-    parts = key.split("/", 1)
+    key_str = _normalize_key(key)
+    parts = key_str.split("/", 1)
     if len(parts) == 1:
         return "", parts[0]
     return parts[0] + "/", parts[1]
 
 
-def _local_path_for_key(key: str) -> Path:
+def _local_path_for_key(key: Any) -> Path:
     """Map an object key to deterministic local fallback filesystem path.
 
     Args:
@@ -78,7 +90,7 @@ def _local_path_for_key(key: str) -> Path:
         return _REPORTS_DIR / rest
     if prefix == "tmp_audio/":
         return _TMP_AUDIO_DIR / rest
-    return _BASE_DIR / key
+    return _BASE_DIR / _normalize_key(key)
 
 
 def _gcs_client() -> Any | None:
