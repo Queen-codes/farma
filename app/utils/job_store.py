@@ -112,6 +112,48 @@ _memory_jobs: Dict[str, Dict[str, Any]] = {}
 _memory_events: Dict[str, List[Dict[str, Any]]] = {}
 
 
+def _collapse_repeated_failures(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse consecutive duplicate failure events for cleaner UI timelines."""
+    if not events:
+        return []
+
+    collapsed: List[Dict[str, Any]] = []
+    for raw in events:
+        event = dict(raw)
+        if not collapsed:
+            event["_repeat_count"] = 1
+            collapsed.append(event)
+            continue
+
+        prev = collapsed[-1]
+        same_failure = (
+            str(prev.get("status") or "") == "failed"
+            and str(event.get("status") or "") == "failed"
+            and str(prev.get("event_type") or "") == str(event.get("event_type") or "")
+            and str(prev.get("step") or "") == str(event.get("step") or "")
+            and str(prev.get("message") or "") == str(event.get("message") or "")
+        )
+        if same_failure:
+            prev["_repeat_count"] = int(prev.get("_repeat_count") or 1) + 1
+            continue
+
+        event["_repeat_count"] = 1
+        collapsed.append(event)
+
+    out: List[Dict[str, Any]] = []
+    for event in collapsed:
+        repeat_count = int(event.pop("_repeat_count", 1) or 1)
+        payload = dict(event.get("payload") or {})
+        if repeat_count > 1:
+            payload["repeat_count"] = repeat_count
+            base_msg = event.get("message") or event.get("event_type") or "failed_event"
+            event["message"] = f"{base_msg} (repeated x{repeat_count})"
+        event["payload"] = payload
+        out.append(event)
+
+    return out
+
+
 class JobStore:
     """Facade for job and event operations with health-aware DB fallback.
 
@@ -470,7 +512,7 @@ class JobStore:
                         .order_by(JobEvent.created_at)
                     )
                     events = result.scalars().all()
-                    return [
+                    normalized = [
                         {
                             "event_id": e.event_id,
                             "job_id": e.job_id,
@@ -484,13 +526,14 @@ class JobStore:
                         }
                         for e in events
                     ]
+                    return _collapse_repeated_failures(normalized)
             except Exception:
                 self._db_available = False
                 self._last_db_failure = datetime.now(timezone.utc)
                 if self._require_db:
                     raise RuntimeError("Job store database unavailable (strict mode enabled)")
 
-        return _memory_events.get(job_id, [])
+        return _collapse_repeated_failures(_memory_events.get(job_id, []))
 
 
 job_store = JobStore()
