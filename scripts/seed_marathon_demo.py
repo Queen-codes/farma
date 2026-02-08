@@ -510,12 +510,8 @@ async def seed() -> None:
             # Create scan
             scan = AegisScan(
                 run_id=run_id,
-                started_at=datetime.strptime(date_str, "%Y-%m-%d").replace(
-                    tzinfo=timezone.utc
-                ),
-                completed_at=datetime.strptime(date_str, "%Y-%m-%d").replace(
-                    tzinfo=timezone.utc
-                )
+                started_at=datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=None),
+                completed_at=datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=None)
                 + timedelta(minutes=3),
                 status="completed",
                 states_scanned=3,
