@@ -253,7 +253,7 @@ def _prompt_payload(report_data: ReportData) -> Dict[str, Any]:
             "risk_level": a.get("risk_level", "UNKNOWN"),
             "ipc_phase": m.get("ipc_phase", 0),
             "idp_estimate": m.get("idp_estimate", 0),
-            "conflict_events": m.get("conflict_events", 0),
+            "conflict_events": m.get("conflict_events_count", m.get("conflict_events", 0)),
             "fatalities": m.get("fatalities", 0),
             "idp_trend": m.get("idp_trend", "stable"),
             "markets_operational": m.get("markets_operational", "unknown"),
