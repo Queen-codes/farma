@@ -399,12 +399,15 @@ async def enqueue_simulation_node(state: Dict[str, Any]) -> Dict[str, Any]:
         },
     )
 
-    await run_simulation_dag(
-        scan_id=scan_id,
-        simulation_id=simulation_id,
-        scenario=scenario,
-        run_id=run_id,
-        emit_job_events=True,
+    # Fire-and-forget: don't block marathon graph on full simulation pipeline
+    asyncio.create_task(
+        run_simulation_dag(
+            scan_id=scan_id,
+            simulation_id=simulation_id,
+            scenario=scenario,
+            run_id=run_id,
+            emit_job_events=True,
+        )
     )
 
     _emit(
@@ -443,38 +446,41 @@ async def enqueue_report_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     sim_id = state.get("simulation_triggered")
 
-    try:
-        report_result = await run_report_dag(
-            report_id=report_id,
-            scan_id=scan_id,
-            states=report_states,
-            include_infographics=True,
-            include_annexes=False,
-            simulation_id=sim_id,
-            output_dir=str(REPORTS_DIR),
-            emit_job_events=True,
-        )
-        await job_store.update_job(
-            report_id,
-            status="completed",
-            result=report_result,
-            completed_at=_utcnow_naive(),
-        )
-    except Exception as exc:
-        await job_store.update_job(
-            report_id,
-            status="failed",
-            result={"error": str(exc)},
-            completed_at=_utcnow_naive(),
-        )
-        await job_store.add_event(
-            report_id,
-            event_type="report_failed",
-            status="failed",
-            step="report_error",
-            message=str(exc),
-        )
-        raise
+    # Fire-and-forget: don't block marathon graph on full report pipeline
+    async def _run_report() -> None:
+        try:
+            report_result = await run_report_dag(
+                report_id=report_id,
+                scan_id=scan_id,
+                states=report_states,
+                include_infographics=True,
+                include_annexes=False,
+                simulation_id=sim_id,
+                output_dir=str(REPORTS_DIR),
+                emit_job_events=True,
+            )
+            await job_store.update_job(
+                report_id,
+                status="completed",
+                result=report_result,
+                completed_at=_utcnow_naive(),
+            )
+        except Exception as exc:
+            await job_store.update_job(
+                report_id,
+                status="failed",
+                result={"error": str(exc)},
+                completed_at=_utcnow_naive(),
+            )
+            await job_store.add_event(
+                report_id,
+                event_type="report_failed",
+                status="failed",
+                step="report_error",
+                message=str(exc),
+            )
+
+    asyncio.create_task(_run_report())
 
     _emit(
         "marathon.report_enqueued",
