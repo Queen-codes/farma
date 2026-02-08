@@ -66,6 +66,17 @@ router = APIRouter(
 )
 
 
+@router.post("/seed-demo")
+async def seed_marathon_demo() -> dict[str, Any]:
+    """One-time endpoint to seed marathon demo data into the database."""
+    from scripts.seed_marathon_demo import seed
+    try:
+        await seed()
+        return {"status": "ok", "message": "Marathon demo data seeded successfully."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.get("/dashboard", response_model=AegisDashboardResponse)
 async def get_aegis_dashboard() -> AegisDashboardResponse:
     """Return high-level AEGIS dashboard aggregates.
