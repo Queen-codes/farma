@@ -20,6 +20,28 @@ def _utcnow_naive() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _compact_result(
+    *,
+    track_id: str,
+    day_date: str,
+    state: Optional[dict],
+) -> Dict[str, Any]:
+    """Build compact JSON-safe result payload for marathon job status."""
+    st = state or {}
+    return {
+        "track_id": track_id,
+        "day_date": day_date,
+        "scan_id": st.get("scan_id"),
+        "prev_scan_id": st.get("prev_scan_id"),
+        "mode": st.get("mode"),
+        "thinking_level": st.get("effective_thinking_level"),
+        "actions_taken": list(st.get("actions_taken") or []),
+        "simulation_triggered": st.get("simulation_triggered"),
+        "report_triggered": st.get("report_triggered"),
+        "status": "completed",
+    }
+
+
 async def run_marathon_day(
     *,
     run_id: str,
@@ -87,7 +109,7 @@ async def run_marathon_day(
         async for item in marathon_graph.astream(
             initial,
             stream_mode=["custom", "values"],
-            config={"configurable": {"thread_id": track_id}},
+            config={"configurable": {"thread_id": run_id}},
         ):
             if isinstance(item, tuple) and len(item) == 2:
                 stream_mode, payload = item
@@ -99,10 +121,15 @@ async def run_marathon_day(
             elif stream_mode == "values" and isinstance(payload, dict):
                 final_state = payload
 
+        result_payload = _compact_result(
+            track_id=track_id,
+            day_date=day_date,
+            state=final_state,
+        )
         await job_store.update_job(
             run_id,
             status="completed",
-            result=final_state or {},
+            result=result_payload,
             completed_at=_utcnow_naive(),
         )
         await job_store.add_event(
@@ -113,23 +140,29 @@ async def run_marathon_day(
             payload={
                 "track_id": track_id,
                 "day_date": day_date,
-                "actions_taken": (final_state or {}).get("actions_taken") or [],
+                "actions_taken": result_payload.get("actions_taken") or [],
             },
         )
         return final_state or {}
 
     except Exception as e:
-        await job_store.update_job(
-            run_id,
-            status="failed",
-            result={"error": str(e)},
-            completed_at=_utcnow_naive(),
-        )
-        await job_store.add_event(
-            run_id,
-            event_type="marathon_failed",
-            status="failed",
-            step="marathon_error",
-            message=str(e),
-        )
+        try:
+            await job_store.update_job(
+                run_id,
+                status="failed",
+                result={"error": str(e), "track_id": track_id, "day_date": day_date},
+                completed_at=_utcnow_naive(),
+            )
+        except Exception:
+            pass
+        try:
+            await job_store.add_event(
+                run_id,
+                event_type="marathon_failed",
+                status="failed",
+                step="marathon_error",
+                message=str(e),
+            )
+        except Exception:
+            pass
         raise
