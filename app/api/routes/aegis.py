@@ -97,6 +97,51 @@ def _period_day_date(days_back: int) -> str:
     return now.strftime("%Y-%m-%d")
 
 
+async def _next_marathon_day_date_for_demo(
+    *,
+    track_id: str,
+    base_day_date: str,
+    days_back: int,
+) -> str:
+    """Return next day_date for demo continuity appends on same track.
+
+    Demo runs should show visible timeline growth (Day 1/2/3...) even when
+    executed repeatedly within the same week window.
+    """
+    from datetime import date, timedelta
+
+    from app.aegis.db.connection import get_async_session
+    from app.aegis.db.models import AegisMarathonDay
+    from sqlalchemy import desc, select
+
+    step_days = 7 if int(days_back) >= 7 else 1
+    try:
+        base = date.fromisoformat(str(base_day_date))
+    except Exception:
+        return str(base_day_date)
+
+    async with get_async_session() as session:
+        res = await session.execute(
+            select(AegisMarathonDay.day_date)
+            .where(AegisMarathonDay.track_id == str(track_id))
+            .order_by(desc(AegisMarathonDay.day_date))
+            .limit(1)
+        )
+        latest = res.scalar_one_or_none()
+
+    if not latest:
+        return base.isoformat()
+
+    try:
+        latest_date = date.fromisoformat(str(latest))
+    except Exception:
+        return base.isoformat()
+
+    if latest_date >= base:
+        return (latest_date + timedelta(days=step_days)).isoformat()
+    return base.isoformat()
+
+
 async def _scan_readiness_snapshot(scan_id: int) -> dict[str, Any]:
     """Compute readiness booleans for a scan-backed pipeline cycle."""
     from app.aegis.db.connection import get_async_session
@@ -702,7 +747,7 @@ async def run_demo_orchestrator(
     states = _normalize_states(payload.states or AEGIS_FOCUS_STATES)
     days_back = int(payload.days_back or 7)
     period_key = _scan_period_key(days_back)
-    day_date = _period_day_date(days_back)
+    base_day_date = _period_day_date(days_back)
     track_id = str(payload.track_id or f"demo-track-{period_key}")
     run_id = f"DEMO-{uuid.uuid4().hex[:8].upper()}"
 
@@ -742,6 +787,7 @@ async def run_demo_orchestrator(
         simulation_run_id = ""
         report_id = ""
         marathon_run_id = ""
+        day_date = str(base_day_date)
 
         try:
             # 1) Seed demo baseline if missing
@@ -1001,6 +1047,11 @@ async def run_demo_orchestrator(
             )
 
             # 6) Marathon append
+            day_date = await _next_marathon_day_date_for_demo(
+                track_id=track_id,
+                base_day_date=base_day_date,
+                days_back=days_back,
+            )
             marathon_run_id = f"MARA-{uuid.uuid4().hex[:8].upper()}"
             await job_store.create_job(
                 marathon_run_id,
@@ -1812,30 +1863,83 @@ async def get_report_status(report_id: str) -> AegisReportStatusResponse:
     Latency:
         Depends on job-store backend latency.
     """
+    from app.aegis.db.connection import get_async_session
+    from app.aegis.db.models import AegisReport
+    from sqlalchemy import select
+
     job = await job_store.get_job(report_id)
-    if not job:
+
+    db_row = None
+    async with get_async_session() as session:
+        res = await session.execute(
+            select(AegisReport).where(AegisReport.report_id == report_id)
+        )
+        db_row = res.scalar_one_or_none()
+
+    if not job and not db_row:
         raise HTTPException(status_code=404, detail=f"Report {report_id} not found")
-    status_value = (job.get("status") or "running").lower()
+
+    result_payload = (job or {}).get("result") or {}
+    status_value = (
+        (job or {}).get("status")
+        or (db_row.status if db_row else None)
+        or "running"
+    ).lower()
     if status_value == "error":
         status_value = "failed"
     if status_value not in {"running", "completed", "failed"}:
         status_value = "running"
+
+    raw_states = result_payload.get("states_analyzed")
+    if raw_states is None:
+        raw_states = result_payload.get("states")
+    if isinstance(raw_states, dict):
+        raw_states = raw_states.get("states") or []
+    if not isinstance(raw_states, list):
+        raw_states = []
+
+    raw_steps = (job or {}).get("steps_completed") or []
+    if not isinstance(raw_steps, list):
+        raw_steps = []
+
+    raw_timings = (job or {}).get("timings") or {}
+    if not isinstance(raw_timings, dict):
+        raw_timings = {}
+
+    raw_db_states = (db_row.states or {}) if db_row and db_row.states else {}
+    if isinstance(raw_db_states, dict):
+        raw_db_states = raw_db_states.get("states") or []
+    if not raw_states and isinstance(raw_db_states, list):
+        raw_states = raw_db_states
+
+    pdf_path = result_payload.get("pdf_path")
+    if not pdf_path and db_row:
+        pdf_path = db_row.pdf_path
+    has_download = bool(pdf_path or (db_row and db_row.gcs_key))
+
     return AegisReportStatusResponse(
         report_id=report_id,
         status=ReportStatus(status_value),
-        started_at=job.get("started_at"),
-        completed_at=job.get("completed_at"),
-        pdf_path=(job.get("result") or {}).get("pdf_path"),
+        started_at=(job or {}).get("started_at") or (db_row.started_at if db_row else None),
+        completed_at=(job or {}).get("completed_at") or (db_row.completed_at if db_row else None),
+        pdf_path=pdf_path,
         download_url=f"/api/aegis/report/{report_id}/download"
-        if (job.get("result") or {}).get("pdf_path")
+        if has_download
         else None,
-        steps_completed=job.get("steps_completed") or [],
-        timings=job.get("timings") or {},
-        error=(job.get("result") or {}).get("error"),
-        states_analyzed=(job.get("result") or {}).get("states") or [],
-        sources_cited=(job.get("result") or {}).get("sources_cited") or 0,
-        infographics_generated=(job.get("result") or {}).get("infographics_generated")
-        or 0,
+        steps_completed=[str(s) for s in raw_steps],
+        timings={
+            str(k): float(v)
+            for k, v in raw_timings.items()
+            if isinstance(k, (str, int, float)) and isinstance(v, (int, float))
+        },
+        error=(
+            str(result_payload.get("error"))
+            if result_payload.get("error") is not None
+            else (db_row.error if db_row else None)
+        ),
+        states_analyzed=[str(s) for s in raw_states],
+        sources_cited=int(result_payload.get("sources_cited") or 0),
+        infographics_generated=int(result_payload.get("infographics_generated") or 0),
     )
 
 
@@ -1876,19 +1980,35 @@ async def download_report(report_id: str) -> Response:
     Latency:
         May be slow for remote GCS download or large PDFs.
     """
+    from app.aegis.db.connection import get_async_session
+    from app.aegis.db.models import AegisReport
+    from sqlalchemy import select
+
     job = await job_store.get_job(report_id)
-    if not job:
+    db_row = None
+    async with get_async_session() as session:
+        res = await session.execute(
+            select(AegisReport).where(AegisReport.report_id == report_id)
+        )
+        db_row = res.scalar_one_or_none()
+
+    if not job and not db_row:
         raise HTTPException(status_code=404, detail="Report not found")
-    if (job.get("status") or "running") != "completed":
+
+    status_value = (
+        (job or {}).get("status") or (db_row.status if db_row else None) or "running"
+    )
+    if str(status_value).lower() != "completed":
         raise HTTPException(status_code=400, detail="Report not yet completed")
 
-    pdf_path = (job.get("result") or {}).get("pdf_path")
+    result_payload = (job or {}).get("result") or {}
+    pdf_path = result_payload.get("pdf_path") or (db_row.pdf_path if db_row else None)
     if not pdf_path or not Path(pdf_path).exists():
         try:
             from app.utils.gcs_store import download_bytes
             from app.config import GCS_BUCKET, GCS_REPORT_PREFIX
 
-            gcs_key = (job.get("result") or {}).get("gcs_key")
+            gcs_key = result_payload.get("gcs_key") or (db_row.gcs_key if db_row else None)
             if not gcs_key and pdf_path:
                 gcs_key = GCS_REPORT_PREFIX + Path(pdf_path).name
             if gcs_key:
@@ -1949,44 +2069,100 @@ async def list_reports() -> dict[str, Any]:
         GCS listing can be slower than local fallback.
     """
     reports: list[dict[str, Any]] = []
-    try:
-        from app.utils.gcs_store import list_objects
-        from app.config import GCS_BUCKET, GCS_REPORT_PREFIX
+    seen: set[str] = set()
 
-        objs = list_objects(GCS_BUCKET, GCS_REPORT_PREFIX)
-        for obj in objs:
-            name = obj.get("name") or ""
-            if not name.endswith(".pdf"):
+    # Preferred source: persisted report rows (stable even when job_store is ephemeral).
+    try:
+        from app.aegis.db.connection import get_async_session
+        from app.aegis.db.models import AegisReport
+        from sqlalchemy import desc, select
+
+        async with get_async_session() as session:
+            res = await session.execute(
+                select(AegisReport)
+                .where(AegisReport.status == "completed")
+                .order_by(desc(AegisReport.completed_at), desc(AegisReport.created_at))
+            )
+            rows = res.scalars().all()
+
+        for row in rows:
+            filename = None
+            if row.pdf_path:
+                filename = Path(row.pdf_path).name
+            elif row.gcs_key:
+                filename = Path(row.gcs_key).name
+            if not filename:
+                filename = f"{row.report_id}.pdf"
+
+            if filename in seen:
                 continue
-            filename = Path(name).name
-            report_id = filename.rsplit("_", 1)[-1].replace(".pdf", "")
-            updated = obj.get("updated")
-            if hasattr(updated, "isoformat"):
-                created_at = updated.isoformat()
-            else:
-                created_at = (
-                    datetime.fromtimestamp(float(updated)).isoformat()
-                    if updated
-                    else datetime.now(timezone.utc).isoformat()
-                )
+            seen.add(filename)
+
+            size_bytes = 0
+            try:
+                if row.pdf_path and Path(row.pdf_path).exists():
+                    size_bytes = int(Path(row.pdf_path).stat().st_size)
+            except Exception:
+                size_bytes = 0
+
+            created_dt = row.completed_at or row.created_at or datetime.now(timezone.utc)
+            created_at = (
+                created_dt.isoformat()
+                if hasattr(created_dt, "isoformat")
+                else str(created_dt)
+            )
+
             reports.append(
                 {
                     "filename": filename,
                     "created_at": created_at,
-                    "size_bytes": int(obj.get("size") or 0),
-                    "download_url": f"/api/aegis/report/{report_id}/download",
+                    "size_bytes": size_bytes,
+                    "download_url": f"/api/aegis/report/{row.report_id}/download",
                 }
             )
     except Exception:
-        for pdf_file in REPORTS_DIR.glob("*.pdf"):
-            reports.append(
-                {
-                    "filename": pdf_file.name,
-                    "created_at": datetime.fromtimestamp(pdf_file.stat().st_mtime).isoformat(),
-                    "size_bytes": pdf_file.stat().st_size,
-                    "download_url": f"/static/reports/{pdf_file.name}",
-                }
-            )
+        pass
+
+    # Fallback: object listing from GCS.
+    if not reports:
+        try:
+            from app.utils.gcs_store import list_objects
+            from app.config import GCS_BUCKET, GCS_REPORT_PREFIX
+
+            objs = list_objects(GCS_BUCKET, GCS_REPORT_PREFIX)
+            for obj in objs:
+                name = obj.get("name") or ""
+                if not name.endswith(".pdf"):
+                    continue
+                filename = Path(name).name
+                report_id = filename.rsplit("_", 1)[-1].replace(".pdf", "")
+                updated = obj.get("updated")
+                if hasattr(updated, "isoformat"):
+                    created_at = updated.isoformat()
+                else:
+                    created_at = (
+                        datetime.fromtimestamp(float(updated)).isoformat()
+                        if updated
+                        else datetime.now(timezone.utc).isoformat()
+                    )
+                reports.append(
+                    {
+                        "filename": filename,
+                        "created_at": created_at,
+                        "size_bytes": int(obj.get("size") or 0),
+                        "download_url": f"/api/aegis/report/{report_id}/download",
+                    }
+                )
+        except Exception:
+            for pdf_file in REPORTS_DIR.glob("*.pdf"):
+                reports.append(
+                    {
+                        "filename": pdf_file.name,
+                        "created_at": datetime.fromtimestamp(pdf_file.stat().st_mtime).isoformat(),
+                        "size_bytes": pdf_file.stat().st_size,
+                        "download_url": f"/static/reports/{pdf_file.name}",
+                    }
+                )
 
     reports.sort(key=lambda x: x["created_at"], reverse=True)
     return {"reports": reports, "total": len(reports)}

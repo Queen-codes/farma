@@ -13,6 +13,7 @@ Assumptions:
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
@@ -250,6 +251,22 @@ def _kpi_row(
     return t
 
 
+def _normalize_section_text(value: object) -> str:
+    """Normalize potentially non-string narrative payloads to text."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n\n".join(str(item) for item in value)
+    if isinstance(value, dict):
+        try:
+            return json.dumps(value, ensure_ascii=False, indent=2)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
 # Main PDF builder
 def build_pdf(
     *,
@@ -349,14 +366,12 @@ def build_pdf(
     story.append(PageBreak())
 
     # Section helper
-    def section(title: str, body: str | list, level: str = "h1") -> None:
+    def section(title: str, body: object, level: str = "h1") -> None:
         """Append one narrative section block to story flowables."""
         story.append(Paragraph(title, styles[level]))
         story.append(_hr())
-        # LLM sometimes returns a list instead of a string; normalize.
-        if isinstance(body, list):
-            body = "\n\n".join(str(item) for item in body)
-        for para in (body or "").split("\n\n"):
+        normalized = _normalize_section_text(body)
+        for para in normalized.split("\n\n"):
             cleaned = para.strip()
             if not cleaned:
                 continue
@@ -419,9 +434,8 @@ def build_pdf(
         story.append(_hr())
         for state_name, text in narrative.state_annexes.items():
             story.append(Paragraph(state_name, styles["annex_title"]))
-            if isinstance(text, list):
-                text = "\n\n".join(str(item) for item in text)
-            for para in (text or "").split("\n\n"):
+            normalized = _normalize_section_text(text)
+            for para in normalized.split("\n\n"):
                 cleaned = para.strip()
                 if not cleaned:
                     continue

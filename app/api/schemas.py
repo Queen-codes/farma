@@ -301,8 +301,8 @@ class AegisReportStatusResponse(BaseModel):
 
     report_id: str
     status: ReportStatus
-    started_at: Optional[str] = None
-    completed_at: Optional[str] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
     pdf_path: Optional[str] = None
     download_url: Optional[str] = None
     steps_completed: List[str] = []
