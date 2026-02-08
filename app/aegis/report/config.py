@@ -28,7 +28,7 @@ class ReportDAGConfig:
 
     image_model: str = "gemini-3-pro-image-preview"
     image_aspect_ratio: str = "16:9"
-    image_size: str = "4K"
+    image_size: str = "2K"
     image_concurrency: int = 2
 
     cache_dir: Path = REPORTS_DIR / "_aegis_cache" / "infographics"
