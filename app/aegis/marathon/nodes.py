@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from langgraph.config import get_stream_writer
@@ -52,6 +52,18 @@ def _emit(event: str, payload: Optional[dict] = None, status: str = "running") -
             "payload": payload or {},
         }
     )
+
+
+def _is_month_boundary(day_date: str, prev_day_date: Optional[str]) -> bool:
+    """True when current continuity entry starts a new calendar month."""
+    if not prev_day_date:
+        return False
+    try:
+        current = date.fromisoformat(str(day_date))
+        previous = date.fromisoformat(str(prev_day_date))
+    except Exception:
+        return False
+    return (current.year, current.month) != (previous.year, previous.month)
 
 
 # Node 1: load_context — load previous day's state + choose thinking level
@@ -129,6 +141,7 @@ async def load_context_node(state: Dict[str, Any]) -> Dict[str, Any]:
         "prev_thought_signature": (
             getattr(prev_row, "thought_signature", None) if prev_row else None
         ),
+        "prev_day_date": (str(getattr(prev_row, "day_date")) if prev_row else None),
         "prior_model_content_json": (
             getattr(prev_row, "stored_model_content_json", None) if prev_row else None
         ),
@@ -350,14 +363,34 @@ async def generate_continuity_note_node(state: Dict[str, Any]) -> Dict[str, Any]
 # Node 5: decide_actions — deterministic rules for sub-agent dispatch
 async def decide_actions_node(state: Dict[str, Any]) -> Dict[str, Any]:
     """Apply deterministic escalation rules to decide autonomous actions."""
+    cfg = state.get("config") or {}
+    if bool(cfg.get("disable_actions")):
+        _emit(
+            "marathon.actions_decided",
+            {
+                "actions": [],
+                "critical_states": [],
+                "escalation": False,
+                "monthly_report_due": False,
+                "actions_disabled": True,
+            },
+            status="completed",
+        )
+        return {"actions_taken": []}
+
     delta = state.get("delta_json") or {}
     actions: List[str] = []
+    escalation = has_escalation(delta)
 
-    if has_escalation(delta):
+    if escalation:
         actions.append("enqueue_simulation")
 
     crits = critical_states(delta)
-    if crits:
+    monthly_report_due = _is_month_boundary(
+        str(state.get("day_date") or ""),
+        state.get("prev_day_date"),
+    )
+    if crits or monthly_report_due:
         actions.append("enqueue_report")
 
     _emit(
@@ -365,7 +398,8 @@ async def decide_actions_node(state: Dict[str, Any]) -> Dict[str, Any]:
         {
             "actions": actions,
             "critical_states": crits,
-            "escalation": has_escalation(delta),
+            "escalation": escalation,
+            "monthly_report_due": monthly_report_due,
         },
         status="completed",
     )

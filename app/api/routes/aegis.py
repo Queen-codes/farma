@@ -735,20 +735,18 @@ async def run_demo_orchestrator(
     """Run a one-click end-to-end demo cycle with a single parent job stream.
 
     Flow:
-        seed-if-needed -> scan(reuse-or-run) -> synthesis(check-or-run) ->
-        simulation -> report -> marathon append -> timeline snapshot.
+        seed-if-needed -> bootstrap baseline continuity -> scan(reuse-or-run) ->
+        synthesis(check-or-run) -> marathon append -> timeline snapshot.
     """
     from app.aegis.graph import run_aegis_scan
     from app.aegis.marathon.runner import run_marathon_day
-    from app.aegis.report.runner import run_report_dag
-    from app.aegis.simulator.runner import run_simulation_dag
     from app.aegis.synthesis.runner import run_synthesis_dag
 
     states = _normalize_states(payload.states or AEGIS_FOCUS_STATES)
     days_back = int(payload.days_back or 7)
     period_key = _scan_period_key(days_back)
     base_day_date = _period_day_date(days_back)
-    track_id = str(payload.track_id or f"demo-track-{period_key}")
+    track_id = str(payload.track_id or "demo-track")
     run_id = f"DEMO-{uuid.uuid4().hex[:8].upper()}"
 
     await job_store.create_job(
@@ -779,15 +777,19 @@ async def run_demo_orchestrator(
         from sqlalchemy import select
 
         from app.aegis.db.connection import get_async_session
-        from app.aegis.db.models import AegisScan
+        from app.aegis.db.models import AegisMarathonDay, AegisScan
 
         scan_id = 0
         scan_run_id = ""
         simulation_id = ""
-        simulation_run_id = ""
         report_id = ""
         marathon_run_id = ""
         day_date = str(base_day_date)
+        seeded_weeks = [
+            ("2026-01-19", "SCAN-DEMO-W1"),
+            ("2026-01-26", "SCAN-DEMO-W2"),
+            ("2026-02-02", "SCAN-DEMO-W3"),
+        ]
 
         try:
             # 1) Seed demo baseline if missing
@@ -827,7 +829,103 @@ async def run_demo_orchestrator(
                     message="Baseline demo scans already present",
                 )
 
-            # 2) Scan (reuse unless forced)
+            # 2) Ensure seeded baseline continuity exists on the selected track
+            async with get_async_session() as session:
+                res = await session.execute(
+                    select(AegisMarathonDay.day_date).where(
+                        AegisMarathonDay.track_id == track_id,
+                        AegisMarathonDay.day_date.in_([d for d, _ in seeded_weeks]),
+                    )
+                )
+                present_seed_days = {str(r[0]) for r in res.all() if r and r[0]}
+
+            if len(present_seed_days) < len(seeded_weeks):
+                missing_seed_days = [
+                    d for d, _ in seeded_weeks if d not in present_seed_days
+                ]
+                await job_store.add_event(
+                    run_id,
+                    event_type="demo.baseline_marathon_bootstrap_started",
+                    status="running",
+                    step="marathon_baseline",
+                    message="Bootstrapping seeded continuity weeks on demo track",
+                    payload={
+                        "track_id": track_id,
+                        "missing_seed_weeks": missing_seed_days,
+                    },
+                )
+                async with get_async_session() as session:
+                    seeded_scans_res = await session.execute(
+                        select(AegisScan).where(
+                            AegisScan.run_id.in_([rid for _, rid in seeded_weeks])
+                        )
+                    )
+                    seeded_scans = seeded_scans_res.scalars().all()
+                by_run_id = {str(s.run_id): s for s in seeded_scans}
+                missing_seed_scans = [
+                    rid for _, rid in seeded_weeks if rid not in by_run_id
+                ]
+                if missing_seed_scans:
+                    raise RuntimeError(
+                        "Missing seeded scans required for baseline continuity: "
+                        + ", ".join(missing_seed_scans)
+                    )
+
+                for idx, (seed_day_date, seed_run_id) in enumerate(seeded_weeks):
+                    if seed_day_date in present_seed_days:
+                        continue
+                    seed_scan = by_run_id[str(seed_run_id)]
+                    seed_run = f"MARA-SEED-{uuid.uuid4().hex[:8].upper()}"
+                    prev_seed_scan_id: Optional[int] = None
+                    if idx > 0:
+                        prev_seed_scan_id = int(
+                            by_run_id[str(seeded_weeks[idx - 1][1])].id
+                        )
+                    await job_store.create_job(
+                        seed_run,
+                        "aegis_marathon",
+                        metadata={
+                            "track_id": track_id,
+                            "scan_id": int(seed_scan.id),
+                            "day_date": seed_day_date,
+                            "seeded": True,
+                        },
+                    )
+                    await run_marathon_day(
+                        run_id=seed_run,
+                        track_id=track_id,
+                        day_date=seed_day_date,
+                        scan_id=int(seed_scan.id),
+                        prev_scan_id=prev_seed_scan_id,
+                        mode="manual",
+                        config={
+                            "model": os.getenv(
+                                "GEMINI_MODEL_MARATHON", "gemini-3-flash-preview"
+                            ),
+                            "disable_actions": True,
+                        },
+                        emit_job_events=False,
+                    )
+
+                await job_store.add_event(
+                    run_id,
+                    event_type="demo.baseline_marathon_bootstrap_completed",
+                    status="completed",
+                    step="marathon_baseline",
+                    message="Seeded continuity weeks are now available on the demo track",
+                    payload={"track_id": track_id},
+                )
+            else:
+                await job_store.add_event(
+                    run_id,
+                    event_type="demo.baseline_marathon_bootstrap_skipped",
+                    status="completed",
+                    step="marathon_baseline",
+                    message="Seeded continuity weeks already present on this demo track",
+                    payload={"track_id": track_id},
+                )
+
+            # 3) Scan (reuse unless forced)
             reusable = None
             if not bool(payload.force_refresh):
                 reusable = await _find_reusable_scan(
@@ -908,7 +1006,7 @@ async def run_demo_orchestrator(
             if scan_id <= 0:
                 raise RuntimeError("Could not resolve scan_id for demo run")
 
-            # 3) Synthesis (skip when already ready)
+            # 4) Synthesis (skip when already ready)
             readiness = await _scan_readiness_snapshot(scan_id)
             if bool(readiness.get("synthesis_ready")):
                 await job_store.add_event(
@@ -958,135 +1056,98 @@ async def run_demo_orchestrator(
                     payload={"scan_id": scan_id},
                 )
 
-            # 4) Simulation
-            simulation_id = f"SIM-{uuid.uuid4().hex[:8].upper()}"
-            simulation_run_id = f"DEMO-SIM-{uuid.uuid4().hex[:8].upper()}"
-            scenario = payload.simulation_scenario or {
-                "crisis_type": "conflict",
-                "intensity": 1.5,
-                "duration_days": 7,
-                "geo_scope": {"states": states[:2]},
-            }
-            await job_store.create_job(
-                simulation_run_id,
-                "aegis_simulation",
-                metadata={"scan_id": scan_id, "simulation_id": simulation_id},
-            )
-            await job_store.add_event(
-                run_id,
-                event_type="demo.simulation_started",
-                status="running",
-                step="simulation",
-                payload={"scan_id": scan_id, "simulation_id": simulation_id},
-            )
-            sim_result = await run_simulation_dag(
-                scan_id=int(scan_id),
-                simulation_id=simulation_id,
-                scenario=scenario,
-                run_id=simulation_run_id,
-                emit_job_events=False,
-                config={
-                    "model": os.getenv("GEMINI_MODEL_SIMULATOR", "gemini-3-flash-preview"),
-                    "thinking_level": os.getenv("SIMULATOR_THINKING_LEVEL", "LOW"),
-                },
-            )
-            await job_store.add_event(
-                run_id,
-                event_type="demo.simulation_completed",
-                status="completed",
-                step="simulation",
-                payload={
-                    "scan_id": scan_id,
-                    "simulation_id": simulation_id,
-                    "status": sim_result.get("status"),
-                },
-            )
+            # 5) Marathon append (agent decides downstream simulation/report actions)
+            latest_day_row = None
+            async with get_async_session() as session:
+                latest_res = await session.execute(
+                    select(AegisMarathonDay)
+                    .where(AegisMarathonDay.track_id == track_id)
+                    .order_by(AegisMarathonDay.day_date.desc())
+                    .limit(1)
+                )
+                latest_day_row = latest_res.scalar_one_or_none()
 
-            # 5) Report
-            report_id = f"RPT-{uuid.uuid4().hex[:8].upper()}"
-            await job_store.create_job(
-                report_id,
-                "aegis_report",
-                metadata={"scan_id": scan_id, "states": states},
-            )
-            await job_store.add_event(
-                run_id,
-                event_type="demo.report_started",
-                status="running",
-                step="report",
-                payload={"scan_id": scan_id, "report_id": report_id},
-            )
-            report_result = await run_report_dag(
-                report_id=report_id,
-                scan_id=int(scan_id),
-                states=states,
-                include_infographics=bool(payload.include_infographics),
-                include_annexes=bool(payload.include_annexes),
-                output_dir=str(REPORTS_DIR),
-                simulation_id=simulation_id,
-                emit_job_events=False,
-            )
-            await job_store.update_job(
-                report_id,
-                status="completed",
-                result=report_result,
-                completed_at=utcnow_naive(),
-            )
-            await job_store.add_event(
-                run_id,
-                event_type="demo.report_completed",
-                status="completed",
-                step="report",
-                payload={
-                    "report_id": report_id,
-                    "pdf_path": report_result.get("pdf_path"),
-                    "infographics_generated": report_result.get(
-                        "infographics_generated"
+            if latest_day_row and int(latest_day_row.scan_id) == int(scan_id):
+                day_date = str(latest_day_row.day_date)
+                simulation_id = str(latest_day_row.simulation_triggered or "")
+                report_id = str(latest_day_row.report_triggered or "")
+                marathon_result = {
+                    "actions_taken": latest_day_row.actions_taken or [],
+                    "simulation_triggered": simulation_id or None,
+                    "report_triggered": report_id or None,
+                }
+                await job_store.add_event(
+                    run_id,
+                    event_type="demo.marathon_skipped_same_scan",
+                    status="completed",
+                    step="marathon",
+                    message=(
+                        f"Latest marathon entry already uses scan {scan_id}; "
+                        "continuity unchanged for this period."
                     ),
-                },
-            )
-
-            # 6) Marathon append
-            day_date = await _next_marathon_day_date_for_demo(
-                track_id=track_id,
-                base_day_date=base_day_date,
-                days_back=days_back,
-            )
-            marathon_run_id = f"MARA-{uuid.uuid4().hex[:8].upper()}"
-            await job_store.create_job(
-                marathon_run_id,
-                "aegis_marathon",
-                metadata={
-                    "track_id": track_id,
-                    "scan_id": scan_id,
-                    "day_date": day_date,
-                },
-            )
-            await job_store.add_event(
-                run_id,
-                event_type="demo.marathon_started",
-                status="running",
-                step="marathon",
-                payload={
-                    "track_id": track_id,
-                    "scan_id": scan_id,
-                    "day_date": day_date,
-                },
-            )
-            marathon_result = await run_marathon_day(
-                run_id=marathon_run_id,
-                track_id=track_id,
-                day_date=day_date,
-                scan_id=int(scan_id),
-                prev_scan_id=None,
-                mode="manual",
-                config={
-                    "model": os.getenv(
-                        "GEMINI_MODEL_MARATHON", "gemini-3-flash-preview"
-                    ),
-                },
-                emit_job_events=False,
-            )
+                    payload={
+                        "track_id": track_id,
+                        "scan_id": scan_id,
+                        "day_date": day_date,
+                    },
+                )
+            else:
+                day_date = await _next_marathon_day_date_for_demo(
+                    track_id=track_id,
+                    base_day_date=base_day_date,
+                    days_back=days_back,
+                )
+                marathon_run_id = f"MARA-{uuid.uuid4().hex[:8].upper()}"
+                await job_store.create_job(
+                    marathon_run_id,
+                    "aegis_marathon",
+                    metadata={
+                        "track_id": track_id,
+                        "scan_id": scan_id,
+                        "day_date": day_date,
+                    },
+                )
+                await job_store.add_event(
+                    run_id,
+                    event_type="demo.marathon_started",
+                    status="running",
+                    step="marathon",
+                    payload={
+                        "track_id": track_id,
+                        "scan_id": scan_id,
+                        "day_date": day_date,
+                    },
+                )
+                marathon_result = await run_marathon_day(
+                    run_id=marathon_run_id,
+                    track_id=track_id,
+                    day_date=day_date,
+                    scan_id=int(scan_id),
+                    prev_scan_id=None,
+                    mode="manual",
+                    config={
+                        "model": os.getenv(
+                            "GEMINI_MODEL_MARATHON", "gemini-3-flash-preview"
+                        ),
+                    },
+                    emit_job_events=False,
+                )
+                simulation_id = str(marathon_result.get("simulation_triggered") or "")
+                report_id = str(marathon_result.get("report_triggered") or "")
+                await job_store.add_event(
+                    run_id,
+                    event_type="demo.marathon_completed",
+                    status="completed",
+                    step="marathon",
+                    payload={
+                        "track_id": track_id,
+                        "scan_id": scan_id,
+                        "day_date": day_date,
+                        "actions_taken": marathon_result.get("actions_taken") or [],
+                        "simulation_triggered": simulation_id or None,
+                        "report_triggered": report_id or None,
+                    },
+                )
 
             timeline = await get_marathon_timeline(track_id)
             result_payload = {
@@ -1096,9 +1157,8 @@ async def run_demo_orchestrator(
                 "day_date": day_date,
                 "scan_id": scan_id,
                 "scan_run_id": scan_run_id,
-                "simulation_id": simulation_id,
-                "simulation_run_id": simulation_run_id,
-                "report_id": report_id,
+                "simulation_id": simulation_id or None,
+                "report_id": report_id or None,
                 "marathon_run_id": marathon_run_id,
                 "marathon_actions": marathon_result.get("actions_taken") or [],
                 "timeline": timeline.model_dump(),

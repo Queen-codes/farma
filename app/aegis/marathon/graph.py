@@ -47,6 +47,7 @@ class MarathonState(TypedDict):
     prev_assessments: Annotated[List[Dict[str, Any]], operator.add]
     prior_model_content_json: Optional[dict]
     prev_thought_signature: Optional[str]
+    prev_day_date: Optional[str]
     prev_continuity_note: Optional[dict]  # previous day's note (for self-correction)
 
     # Computed
