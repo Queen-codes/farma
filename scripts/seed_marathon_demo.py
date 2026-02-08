@@ -9,9 +9,9 @@ Creates:
 Run: python scripts/seed_marathon_demo.py
 
 Demo flow after seeding:
-  POST /api/aegis/marathon/run {"track_id":"demo-track","scan_id":1,"day_date":"2025-01-13"}
-  POST /api/aegis/marathon/run {"track_id":"demo-track","scan_id":2,"prev_scan_id":1,"day_date":"2025-01-20"}
-  POST /api/aegis/marathon/run {"track_id":"demo-track","scan_id":3,"prev_scan_id":2,"day_date":"2025-01-27"}
+  POST /api/aegis/marathon/run {"track_id":"demo-track","scan_id":1,"day_date":"2026-01-19"}
+  POST /api/aegis/marathon/run {"track_id":"demo-track","scan_id":2,"prev_scan_id":1,"day_date":"2026-01-26"}
+  POST /api/aegis/marathon/run {"track_id":"demo-track","scan_id":3,"prev_scan_id":2,"day_date":"2026-02-02"}
   GET  /api/aegis/marathon/demo-track/timeline
 """
 
@@ -31,13 +31,13 @@ from app.aegis.db.models import AegisScan, StateIntelligence, ConflictEvent
 # Source URIs (realistic but not real — demo data)
 
 SOURCES = [
-    "https://acleddata.com/data-export-tool/nigeria-borno-2025-01",
-    "https://acleddata.com/data-export-tool/nigeria-adamawa-2025-01",
-    "https://acleddata.com/data-export-tool/nigeria-yobe-2025-01",
+    "https://acleddata.com/data-export-tool/nigeria-borno-2026-01",
+    "https://acleddata.com/data-export-tool/nigeria-adamawa-2026-01",
+    "https://acleddata.com/data-export-tool/nigeria-yobe-2026-01",
     "https://dtm.iom.int/nigeria/displacement-report-round-47",
     "https://dtm.iom.int/nigeria/displacement-report-round-48",
-    "https://fews.net/west-africa/nigeria/food-security-outlook/january-2025",
-    "https://reliefweb.int/report/nigeria/nigeria-humanitarian-update-january-2025",
+    "https://fews.net/west-africa/nigeria/food-security-outlook/january-2026",
+    "https://reliefweb.int/report/nigeria/nigeria-humanitarian-update-january-2026",
     "https://www.humanitarianresponse.info/en/operations/nigeria/food-security",
     "https://data.unhcr.org/en/country/nga",
     "https://www.ipcinfo.org/ipc-country-analysis/details-map/en/c/1157800/",
@@ -122,9 +122,9 @@ WEEK3 = {
 }
 
 WEEKS = [
-    ("2025-01-13", WEEK1, "SCAN-DEMO-W1"),
-    ("2025-01-20", WEEK2, "SCAN-DEMO-W2"),
-    ("2025-01-27", WEEK3, "SCAN-DEMO-W3"),
+    ("2026-01-19", WEEK1, "SCAN-DEMO-W1"),
+    ("2026-01-26", WEEK2, "SCAN-DEMO-W2"),
+    ("2026-02-02", WEEK3, "SCAN-DEMO-W3"),
 ]
 
 EVENT_TYPES = [
@@ -618,13 +618,13 @@ async def seed() -> None:
     print("\nDone! Demo data seeded successfully.")
     print("\nMarathon demo commands:")
     print(
-        "  POST /api/aegis/marathon/run {track_id:'demo-track', scan_id:1, day_date:'2025-01-13'}"
+        "  POST /api/aegis/marathon/run {track_id:'demo-track', scan_id:1, day_date:'2026-01-19'}"
     )
     print(
-        "  POST /api/aegis/marathon/run {track_id:'demo-track', scan_id:2, prev_scan_id:1, day_date:'2025-01-20'}"
+        "  POST /api/aegis/marathon/run {track_id:'demo-track', scan_id:2, prev_scan_id:1, day_date:'2026-01-26'}"
     )
     print(
-        "  POST /api/aegis/marathon/run {track_id:'demo-track', scan_id:3, prev_scan_id:2, day_date:'2025-01-27'}"
+        "  POST /api/aegis/marathon/run {track_id:'demo-track', scan_id:3, prev_scan_id:2, day_date:'2026-02-02'}"
     )
     print("  GET  /api/aegis/marathon/demo-track/timeline")
 

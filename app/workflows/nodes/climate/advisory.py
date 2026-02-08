@@ -71,7 +71,8 @@ async def gemini_climate_advisory(state: FarmaState) -> dict:
         "- Keep language simple (low literacy), short sentences.\n"
         "- Use the farmer's language/dialect.\n"
         "- sms_160 must be <=160 characters.\n"
-        "- If missing crop or location is vague, ask ONE follow-up question.\n\n"
+        "- ALWAYS answer the farmer's weather question first using available forecast data.\n"
+        "- Only set follow_up_question if BOTH crop is missing AND location is completely vague. Never ask about irrigation or equipment.\n\n"
         f"LANGUAGE: {lang}\n"
         f"FARMER QUESTION: {msg}\n"
         f"CROP (optional): {crop}\n"
@@ -113,28 +114,29 @@ async def gemini_climate_advisory(state: FarmaState) -> dict:
         sms = (out.get("sms_160") or "").strip()
         follow_up = (out.get("follow_up_question") or "").strip()
 
-        if follow_up and (not crop or (geo.get("is_vague") is True)):
-            status = "AWAITING_FARMER_RESPONSE"
-            sms = follow_up[:160]
+        # Always include the direct weather answer first
+        summary = [
+            out.get("summary_simple") or "Climate advice generated.",
+            *(out.get("recommendations") or [])[:3],
+        ]
+
+        if follow_up and not crop and geo.get("is_vague") is True:
+            # Both crop AND location are missing/vague — append follow-up but still lead with the answer
+            combined = f"{sms} — {follow_up}" if sms else follow_up
             return {
-                "status": status,
+                "status": "AWAITING_FARMER_RESPONSE",
                 "pending_question": follow_up,
                 "pending_question_type": "climate",
-                "farmer_response": follow_up,
-                "sms_text": sms,
-                "analysis_summary": [
-                    out.get("summary_simple") or "Climate advice generated.",
-                    *(out.get("recommendations") or [])[:2],
-                ],
+                "farmer_response": combined[:160],
+                "sms_text": combined[:160],
+                "analysis_summary": summary,
             }
 
         return {
             "status": "READY_FOR_ANALYSIS",
             "sms_text": sms,
-            "analysis_summary": [
-                out.get("summary_simple") or "Climate advice generated.",
-                *(out.get("recommendations") or [])[:3],
-            ],
+            "farmer_response": sms,
+            "analysis_summary": summary,
         }
 
     raise RuntimeError("climate_advisory_failed")
