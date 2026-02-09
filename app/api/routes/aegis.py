@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -151,51 +151,6 @@ def _period_day_date(days_back: int) -> str:
         monday = now.date().fromordinal(now.date().toordinal() - now.weekday())
         return monday.isoformat()
     return now.strftime("%Y-%m-%d")
-
-
-async def _next_marathon_day_date_for_demo(
-    *,
-    track_id: str,
-    base_day_date: str,
-    days_back: int,
-) -> str:
-    """Return next day_date for demo continuity appends on same track.
-
-    Demo runs should show visible timeline growth (Day 1/2/3...) even when
-    executed repeatedly within the same week window.
-    """
-    from datetime import date, timedelta
-
-    from app.aegis.db.connection import get_async_session
-    from app.aegis.db.models import AegisMarathonDay
-    from sqlalchemy import desc, select
-
-    step_days = 7 if int(days_back) >= 7 else 1
-    try:
-        base = date.fromisoformat(str(base_day_date))
-    except Exception:
-        return str(base_day_date)
-
-    async with get_async_session() as session:
-        res = await session.execute(
-            select(AegisMarathonDay.day_date)
-            .where(AegisMarathonDay.track_id == str(track_id))
-            .order_by(desc(AegisMarathonDay.day_date))
-            .limit(1)
-        )
-        latest = res.scalar_one_or_none()
-
-    if not latest:
-        return base.isoformat()
-
-    try:
-        latest_date = date.fromisoformat(str(latest))
-    except Exception:
-        return base.isoformat()
-
-    if latest_date >= base:
-        return (latest_date + timedelta(days=step_days)).isoformat()
-    return base.isoformat()
 
 
 async def _scan_readiness_snapshot(scan_id: int) -> dict[str, Any]:
@@ -1112,8 +1067,11 @@ async def run_demo_orchestrator(
                     payload={"scan_id": scan_id},
                 )
 
-            # 5) Marathon append (agent decides downstream simulation/report actions)
+            # 5) Marathon run for current period (idempotent by track_id + day_date).
+            # Do not auto-advance to future week labels on repeated demo runs.
             latest_day_row = None
+            current_period_row = None
+            previous_period_row = None
             async with get_async_session() as session:
                 latest_res = await session.execute(
                     select(AegisMarathonDay)
@@ -1123,36 +1081,57 @@ async def run_demo_orchestrator(
                 )
                 latest_day_row = latest_res.scalar_one_or_none()
 
-            if latest_day_row and int(latest_day_row.scan_id) == int(scan_id):
-                day_date = str(latest_day_row.day_date)
-                simulation_id = str(latest_day_row.simulation_triggered or "")
-                report_id = str(latest_day_row.report_triggered or "")
+                current_res = await session.execute(
+                    select(AegisMarathonDay)
+                    .where(
+                        AegisMarathonDay.track_id == track_id,
+                        AegisMarathonDay.day_date == str(base_day_date),
+                    )
+                    .limit(1)
+                )
+                current_period_row = current_res.scalar_one_or_none()
+
+                if current_period_row is None:
+                    prev_res = await session.execute(
+                        select(AegisMarathonDay)
+                        .where(
+                            AegisMarathonDay.track_id == track_id,
+                            AegisMarathonDay.day_date < str(base_day_date),
+                        )
+                        .order_by(AegisMarathonDay.day_date.desc())
+                        .limit(1)
+                    )
+                    previous_period_row = prev_res.scalar_one_or_none()
+
+            if current_period_row is not None:
+                day_date = str(current_period_row.day_date)
+                simulation_id = str(current_period_row.simulation_triggered or "")
+                report_id = str(current_period_row.report_triggered or "")
                 marathon_result = {
-                    "actions_taken": latest_day_row.actions_taken or [],
+                    "actions_taken": current_period_row.actions_taken or [],
                     "simulation_triggered": simulation_id or None,
                     "report_triggered": report_id or None,
                 }
                 await job_store.add_event(
                     run_id,
-                    event_type="demo.marathon_skipped_same_scan",
+                    event_type="demo.marathon_skipped_existing_period",
                     status="completed",
                     step="marathon",
                     message=(
-                        f"Latest marathon entry already uses scan {scan_id}; "
+                        f"Marathon already exists for period day_date={day_date}; "
                         "continuity unchanged for this period."
                     ),
                     payload={
                         "track_id": track_id,
                         "scan_id": scan_id,
+                        "existing_scan_id": int(current_period_row.scan_id),
+                        "latest_scan_id": int(latest_day_row.scan_id) if latest_day_row else None,
+                        "base_day_date": str(base_day_date),
                         "day_date": day_date,
                     },
                 )
             else:
-                day_date = await _next_marathon_day_date_for_demo(
-                    track_id=track_id,
-                    base_day_date=base_day_date,
-                    days_back=days_back,
-                )
+                day_date = str(base_day_date)
                 marathon_run_id = f"MARA-{uuid.uuid4().hex[:8].upper()}"
                 await job_store.create_job(
                     marathon_run_id,
@@ -1179,7 +1158,11 @@ async def run_demo_orchestrator(
                     track_id=track_id,
                     day_date=day_date,
                     scan_id=int(scan_id),
-                    prev_scan_id=None,
+                    prev_scan_id=(
+                        int(previous_period_row.scan_id)
+                        if previous_period_row is not None
+                        else None
+                    ),
                     mode="manual",
                     config={
                         "model": os.getenv(
@@ -1345,7 +1328,22 @@ async def run_marathon_day_endpoint(
             )
 
     run_id = f"MARA-{uuid.uuid4().hex[:8].upper()}"
-    day_date = payload.day_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_utc = datetime.now(timezone.utc).date()
+    if payload.day_date:
+        try:
+            parsed_day_date = date.fromisoformat(str(payload.day_date))
+        except Exception:
+            raise HTTPException(status_code=422, detail="day_date must be in YYYY-MM-DD format")
+    else:
+        parsed_day_date = today_utc
+
+    if parsed_day_date > today_utc:
+        raise HTTPException(
+            status_code=422,
+            detail=f"day_date cannot be in the future (today UTC is {today_utc.isoformat()})",
+        )
+
+    day_date = parsed_day_date.isoformat()
 
     await job_store.create_job(
         run_id,

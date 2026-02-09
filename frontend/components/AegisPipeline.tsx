@@ -21,35 +21,6 @@ function currentWeeklyDayDate() {
   return monday.toISOString().slice(0, 10);
 }
 
-function nextContinuityDayDate(
-  baseDayDate: string,
-  existingDayDates: string[],
-  stepDays: number
-): string {
-  const base = new Date(`${baseDayDate}T00:00:00Z`);
-  if (Number.isNaN(base.getTime())) {
-    return baseDayDate;
-  }
-
-  const parsed = existingDayDates
-    .map((d) => new Date(`${d}T00:00:00Z`))
-    .filter((d) => !Number.isNaN(d.getTime()))
-    .sort((a, b) => a.getTime() - b.getTime());
-
-  if (parsed.length === 0) {
-    return baseDayDate;
-  }
-
-  const latest = parsed[parsed.length - 1];
-  if (latest.getTime() >= base.getTime()) {
-    const next = new Date(latest);
-    next.setUTCDate(next.getUTCDate() + Math.max(stepDays, 1));
-    return next.toISOString().slice(0, 10);
-  }
-
-  return baseDayDate;
-}
-
 function scanWindowLabel(daysBack: number): string {
   const now = new Date();
   const end = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
@@ -649,10 +620,8 @@ export const AegisPipeline: React.FC = () => {
           }
 
           const trackId = marathonTrackId || currentWeeklyTrackId();
-          let timelineSeedDays: string[] = [];
           try {
             const existing = await apiService.getMarathonTimeline(trackId);
-            timelineSeedDays = (existing.days || []).map((d) => d.day_date);
             if (existing.days && existing.days.length > 0) {
               setMarathonResults(existing);
               const latest = existing.days[existing.days.length - 1];
@@ -677,10 +646,7 @@ export const AegisPipeline: React.FC = () => {
           } catch (e) {
             console.error('Failed to load existing timeline before marathon run:', e);
           }
-          if (timelineSeedDays.length === 0 && marathonResults?.track_id === trackId) {
-            timelineSeedDays = (marathonResults.days || []).map((d) => d.day_date);
-          }
-          const dayDate = nextContinuityDayDate(currentWeeklyDayDate(), timelineSeedDays, 7);
+          const dayDate = currentWeeklyDayDate();
           setMarathonTrackId(trackId);
           const resp = await apiService.startMarathonRun(
             trackId,
@@ -1189,7 +1155,7 @@ export const AegisPipeline: React.FC = () => {
                     <div className="space-y-4">
                       <div className="flex gap-4 text-[10px] font-mono text-zinc-500">
                         <span>Track: {marathonResults.track_id}</span>
-                        <span>Weeks: {marathonResults.total_days}</span>
+                        <span>Checkpoints: {marathonResults.total_days}</span>
                         <span>Self-corrections: {marathonResults.total_self_corrections}</span>
                         <span>Actions: {marathonResults.total_actions}</span>
                       </div>
@@ -1209,7 +1175,7 @@ export const AegisPipeline: React.FC = () => {
                                 {/* Header: date + badges */}
                                 <div className="flex justify-between items-center mb-2 pl-2">
                                   <div className="flex items-center gap-2">
-                                    <span className="text-xs font-bold">Week {i + 1}</span>
+                                    <span className="text-xs font-bold">Checkpoint {i + 1}</span>
                                     <span className="text-[10px] text-zinc-500 font-mono">{entry.day_date}</span>
                                   </div>
                                   <div className="flex gap-2 flex-wrap justify-end">

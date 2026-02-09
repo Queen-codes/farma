@@ -3,12 +3,9 @@
 > Built for the Google Deepmind Gemini 3 Hackathon on Devpost
 
 <p align="center">
-  <strong>When 32 million people are food insecure, intelligence can't wait for Monday morning.</strong>
+  <em>A semi-autonomous marathon agent system that refreshes humanitarian intelligence daily on a rolling 7-day window, self-corrects predictions across runs, and enables smallholder farmers to access loans via SMS, powered by Gemini 3 Thought Signatures and Thinking Levels. In demo mode, continuity is presented as weekly checkpoints.</em>
 </p>
 
-<p align="center">
-  <em>A semi-autonomous marathon agent system that continuously monitors humanitarian crises across Nigerian states, self-corrects its own predictions day-over-day, and enables smallholder farmers to access loans via SMS — all powered by Gemini 3's Thought Signatures and Thinking Levels.</em>
-</p>
 
 <p align="center">
   <a href="#demo">View Demo</a> &middot;
@@ -65,7 +62,7 @@ Humanitarian intelligence directly informs financial decisions. If AEGIS detects
 
 > **The Marathon Agent**: Build autonomous systems for tasks spanning hours or days. Use Thought Signatures and Thinking Levels to maintain continuity and self-correct across multi-step tool calls without human supervision.
 
-FARMA doesn't just use the marathon agent concept — it's the architecture. The system runs weekly intelligence cycles autonomously, preserving its reasoning across days via Gemini 3's thought signatures, detecting when its own predictions were wrong, adjusting its thinking depth, and deciding when to escalate.
+FARMA doesn't just use the marathon agent concept — it's the architecture. The system refreshes intelligence daily on a rolling 7-day window, preserves reasoning continuity across runs via Gemini 3 thought signatures, detects when predictions were wrong, adjusts thinking depth, and escalates when needed. In demo presentation mode, continuity is shown as weekly checkpoints for readability.
 
 ---
 
@@ -186,19 +183,19 @@ flowchart LR
 <a id="marathon-agent"></a>
 ## The Marathon Agent — How It Actually Works
 
-This is the core innovation. Most AI systems produce one-shot outputs. FARMA's marathon agent runs continuously, remembers what it said the previous week, checks if it was right, and adjusts.
+This is the core innovation. Most AI systems produce one-shot outputs. FARMA's marathon agent runs continuously, remembers what it said on the previous run, checks if it was right, and adjusts.
 
 <img src="docs/assets/marathon.png" alt="Marathon Timeline" width="100%">
 
 ### The Continuity Loop
 
-Each week after a fresh scan, the marathon agent:
+When Marathon is triggered (demo/manual) after a fresh scan, the marathon agent:
 
 1. **Loads its previous continuity note** from the database — including last predictions
 2. **Resolves the latest scan** and retrieves fresh intelligence data
-3. **Computes deterministic deltas** — what changed between each week at every level (state risk levels, IDP counts, IPC phases, conflict events, priority rankings)
+3. **Computes deterministic deltas** — what changed between runs at every level (state risk levels, IDP counts, IPC phases, conflict events, priority rankings)
 4. **Generates a new continuity note** using Gemini 3 with extended thinking, replaying its prior thought signature for reasoning continuity
-5. **Self-corrects** — compares the last seven days predictions against the new actual data, explicitly logging where it was wrong
+5. **Self-corrects** — compares prior-run predictions against the new actual data, explicitly logging where it was wrong
 6. **Decides its own thinking depth** for the next scan — `"high"` if the situation is novel, `"medium"` if corrections were needed, `"low"` if things are stable
 7. **Autonomously triggers actions** — if it detects a significant escalation, it fires off a simulation run or emergency report without human intervention
 
@@ -208,9 +205,9 @@ Gemini 3 returns an opaque `thought_signature` with each response — a binary b
 
 - Extracts and base64-encodes the thought signature after each generation
 - Stores it in PostgreSQL alongside the continuity note
-- Replays it as prior model content in the next day's call
+- Replays it as prior model content in the next run's call
 
-This gives the agent genuine reasoning continuity across sessions. It doesn't just see the last week's output — it inherits its thinking context.
+This gives the agent genuine reasoning continuity across sessions. It doesn't just see the prior run's output — it inherits its thinking context.
 
 ### Self-Correction in Practice
 
@@ -227,7 +224,7 @@ Day 2: "SELF-CORRECTION: My prediction about Borno stabilization was
 
 ### Continuity Note Schema
 
-Every marathon day produces a structured `ContinuityNote`:
+Every marathon run produces a structured `ContinuityNote`:
 
 | Field | Purpose |
 |-------|---------|
@@ -242,7 +239,7 @@ Every marathon day produces a structured `ContinuityNote`:
 
 ### Thinking Levels — Adaptive Depth
 
-The marathon agent doesn't use the same reasoning depth every week. It dynamically selects:
+The marathon agent doesn't use the same reasoning depth every run. It dynamically selects:
 
 | Level | When Used | Effect |
 |-------|-----------|--------|
@@ -294,7 +291,7 @@ If schema-constrained generation fails, the system retries with JSON-only mode a
 
 | Layer | Technology | Purpose |
 |-------|-----------|---------|
-| **AI** | Gemini 3 Pro, Gemini 3 Flash| Reasoning, analysis, grounded search |
+| **AI** | Gemini 3 Pro, Gemini 3 Flash, Gemini 3 Image Pro| Reasoning, analysis, grounded search, infographics|
 | **Orchestration** | LangGraph | Graph-based workflow with parallel execution, conditional routing |
 | **Backend** | FastAPI (Python 3.12) | Async API with streaming job events |
 | **Database** | PostgreSQL + JSONB (Cloud Sql)| Relational structure with flexible agent output storage |
@@ -329,15 +326,13 @@ If schema-constrained generation fails, the system retries with JSON-only mode a
 
 ### Marathon Continuity Timeline
 
-- Visual timeline of daily continuity notes
+- Visual timeline of continuity checkpoints (weekly in demo view)
 - Predictions vs. self-corrections
 - Decision explanations in the agent's own words
 - Thinking level indicators showing adaptive depth
 
 ### Farmer SMS Simulation
-
-<!-- INSERT: Farmer simulation UI screenshot here -->
-<!-- <img src="docs/assets/farmer_sim.png" alt="Farmer Simulation" width="100%"> -->
+<img src="docs/assets/verification.png" alt="Farmer Simulation" width="100%">
 
 - SMS template builder for testing loan, disease, and climate flows
 - Toggle AEGIS humanitarian intelligence on/off to see its impact on loan decisions
@@ -437,7 +432,13 @@ The one-click demo orchestrator chains all 5 AEGIS stages:
 
 **Scan** → **Synthesis** → **Simulation** → **Report** → **Marathon**
 
-Each stage streams real-time progress events to the UI. The marathon stage generates a continuity note, makes predictions, and — on subsequent runs — self-corrects against its previous predictions.
+Each stage streams real-time progress events to the UI. The marathon stage generates a continuity note, makes predictions, and — on subsequent runs — self-corrects against its previous predictions. In demo mode, marathon entries are displayed as weekly checkpoints anchored to Monday.
+
+Operational note: the unattended scheduler currently runs **Scan → Synthesis → Report** daily (rolling 7-day scan window). Marathon continuity runs are currently triggered via demo/manual endpoints.
+
+- Trigger cadence: daily scheduler execution (configured UTC time).
+- Evidence window: each scheduled scan analyzes a rolling 7-day window.
+- Marathon presentation in demo: continuity is displayed as weekly checkpoints (Monday-anchored labels), while the API itself is day-keyed (`day_date`).
 
 ---
 
