@@ -1465,10 +1465,15 @@ async def get_marathon_timeline(track_id: str) -> AegisMarathonTimelineResponse:
     from app.aegis.db.models import AegisMarathonDay
     from sqlalchemy import select
 
+    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
     async with get_async_session() as session:
         res = await session.execute(
             select(AegisMarathonDay)
-            .where(AegisMarathonDay.track_id == track_id)
+            .where(
+                AegisMarathonDay.track_id == track_id,
+                AegisMarathonDay.day_date <= today_utc,
+            )
             .order_by(AegisMarathonDay.day_date)
         )
         rows = res.scalars().all()

@@ -42,7 +42,7 @@ When humanitarian intelligence is slow, aid is misdirected. When farmers can't a
 
 FARMA is two tightly coupled systems with a critical feedback loop between them:
 
-<img src="docs/assets/overview.png" alt="FARMA System Overview" width="100%"> 
+<img src="docs/assets/overvieww.png" alt="FARMA System Overview" width="100%"> 
 
 ### 1. AEGIS — Autonomous Humanitarian Intelligence
 
@@ -83,10 +83,10 @@ flowchart TB
         S1[Borno Worker] & S2[Adamawa Worker] & S3[Yobe Worker] & S4[Bauchi Worker] & S5[Gombe Worker] & S6[Taraba Worker]
 
         subgraph TOOLS["Grounded Search Tools"]
-            T1["🔍 Conflict Events"]
-            T2["🔍 IDP Displacement"]
-            T3["🔍 Food Security (IPC)"]
-            T4["🔍 Market Status"]
+            T1["Conflict Events"]
+            T2["IDP Displacement"]
+            T3["Food Security (IPC)"]
+            T4["Market Status"]
         end
 
         S1 & S2 & S3 & S4 & S5 & S6 --> TOOLS
@@ -141,7 +141,7 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    SMS["📱 Farmer SMS\n(Local Language)"] --> PARSE["Intent\nExtraction"]
+    SMS["Farmer SMS\n(Local Language)"] --> PARSE["Intent\nExtraction"]
     PARSE --> GATE{"Intent\nClassification"}
 
     GATE -->|Loan Request| LOAN
@@ -172,7 +172,7 @@ flowchart LR
         C1 --> C2 --> C3 --> C4
     end
 
-    LOAN --> RESP["📱 SMS Response\n(Local Language)"]
+    LOAN --> RESP["SMS Response\n(Local Language)"]
     DISEASE --> RESP
     CLIMATE --> RESP
     HUMAN --> RESP
