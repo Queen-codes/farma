@@ -74,46 +74,8 @@ FARMA doesn't just use the marathon agent concept — it's the architecture. The
 
 ### System Architecture Overview
 
-<!-- INSERT: Full system architecture diagram screenshot here -->
-<!-- Example: <img src="docs/assets/architecture_full.png" alt="Full Architecture" width="100%"> -->
+<img src="docs/assets/farma_architecture.png" alt="System Architecture">
 
-```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           FARMA PLATFORM                               │
-│                                                                         │
-│  ┌──────────────────────────────────┐  ┌──────────────────────────────┐ │
-│  │     AEGIS Intelligence System    │  │   Farmer Support System      │ │
-│  │                                  │  │                              │ │
-│  │  ┌────────┐    ┌───────────┐    │  │  ┌─────────┐   ┌─────────┐  │ │
-│  │  │  SCAN  │───▶│ SYNTHESIS │    │  │  │   SMS   │──▶│ INTENT  │  │ │
-│  │  │(parallel│   │(per-state │    │  │  │ Parser  │   │  GATE   │  │ │
-│  │  │workers)│    │+ rollup)  │    │  │  └─────────┘   └────┬────┘  │ │
-│  │  └────────┘    └─────┬─────┘    │  │                     │       │ │
-│  │                      │          │  │         ┌───────────┼───┐   │ │
-│  │              ┌───────┼───────┐  │  │         ▼           ▼   ▼   │ │
-│  │              ▼       ▼       ▼  │  │     ┌──────┐  ┌────────┐│  │ │
-│  │         ┌────────┐┌──────┐┌──────┐│  │  │ LOAN │  │DISEASE ││  │ │
-│  │         │SIMULATE││REPORT││MARATH.││  │  │ FLOW │  │  FLOW  ││  │ │
-│  │         └────────┘└──────┘└──┬───┘│  │  └──┬───┘  └────────┘│  │ │
-│  │                              │    │  │     │       ┌────────┐│  │ │
-│  │              ▲               │    │  │     │       │CLIMATE ││  │ │
-│  │              │  CONTINUITY   │    │  │     │       │  FLOW  ││  │ │
-│  │              └───────────────┘    │  │     │       └────────┘│  │ │
-│  │         (thought signatures +     │  │     │                 │  │ │
-│  │          self-correction loop)    │  │     └─────────────────┘  │ │
-│  └──────────────────────────────────┘  └──────────────────────────────┘ │
-│                    │                              │                      │
-│                    │     FEEDBACK LOOP             │                      │
-│                    │◀─────────────────────────────▶│                      │
-│                    │  Risk flags gate loan          │                      │
-│                    │  decisions in real-time        │                      │
-│                                                                         │
-│  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │                        PostgreSQL                                 │  │
-│  │  Scans │ Assessments │ Continuity Notes │ Reports │ Farmer Jobs  │  │
-│  └───────────────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────────┘
-```
 
 ### AEGIS Pipeline — Detailed Flow
 
@@ -367,11 +329,8 @@ If schema-constrained generation fails, the system retries with JSON-only mode a
 
 ### Marathon Continuity Timeline
 
-<!-- INSERT: Marathon timeline cards screenshot here -->
-<!-- Example: <img src="docs/assets/marathon_cards.png" alt="Marathon Timeline" width="100%"> -->
-
 - Visual timeline of daily continuity notes
-- Predictions vs. self-corrections displayed side-by-side
+- Predictions vs. self-corrections
 - Decision explanations in the agent's own words
 - Thinking level indicators showing adaptive depth
 
@@ -385,11 +344,7 @@ If schema-constrained generation fails, the system retries with JSON-only mode a
 - Job timeline showing each workflow step
 - Human escalation flow for unrecognized intents
 
-### OCHA-Style PDF Reports
-
-<!-- INSERT: Sample report PDF screenshot here -->
-<!-- <img src="docs/assets/report_sample.png" alt="PDF Report" width="100%"> -->
-
+### PDF Reports
 - Professional humanitarian intelligence reports with verified citations
 - State-by-state annexes with risk metrics
 - Infographic visualizations with text-only fallback
@@ -412,8 +367,8 @@ farma/
 │   │   │   └── tools/               # conflict, displacement, food_security, economic
 │   │   ├── synthesis/               # Schema-constrained intelligence processing
 │   │   ├── simulator/               # Crisis projection + policy briefs
-│   │   ├── report/                  # OCHA-style PDF generation
-│   │   ├── marathon/                # ⭐ Day-over-day continuity agent
+│   │   ├── report/                  # PDF generation
+│   │   ├── marathon/                # Day-over-day continuity agent
 │   │   │   ├── nodes.py             # LangGraph nodes for marathon flow
 │   │   │   ├── llm.py              # Thought signature replay + continuity generation
 │   │   │   ├── schema.py           # ContinuityNote Pydantic schema
@@ -558,8 +513,8 @@ cd frontend && npm run dev
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/api/farmer/sms` | Process farmer SMS (loan/disease/climate) |
-| `POST` | `/api/farmer/escalation/{job_id}` | Resume human-escalated job |
+| `POST` | `/api/farmer/simulate` | Start farmer SMS simulation (loan/disease/climate) |
+| `POST` | `/api/farmer/{job_id}/resume` | Resume a human-interrupted farmer job |
 
 ---
 

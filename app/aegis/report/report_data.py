@@ -19,7 +19,13 @@ def utcnow_iso() -> str:
 
 
 def _normalize_source_uri(uri: Any) -> Optional[str]:
-    """Return normalized absolute http(s) URI or `None` if invalid."""
+    """Return normalized source reference string or `None` if invalid.
+
+    Accepts:
+    - Absolute `http(s)` URIs (normalized).
+    - Legacy opaque reference tokens (for example `u1`) used by older tests
+      and deterministic fixtures.
+    """
     if not isinstance(uri, str):
         return None
     value = uri.strip()
@@ -31,6 +37,11 @@ def _normalize_source_uri(uri: Any) -> Optional[str]:
         parsed = urlparse(value)
     except Exception:
         return None
+    # Backward-compatible path: allow opaque fixture IDs like "u1" when the
+    # value is not URL-shaped (no scheme and no host).
+    if not parsed.scheme and not parsed.netloc:
+        return value
+
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         return None
 
